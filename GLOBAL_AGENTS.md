@@ -1,0 +1,1 @@
+/Users/yb/Dev/ai-rules/global-agents.md

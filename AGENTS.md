@@ -1,3 +1,7 @@
+# Global Rules Reference
+> [!IMPORTANT]
+> This project follows global development standards. ALWAYS read [GLOBAL_AGENTS.md](file:///GLOBAL_AGENTS.md) or [global-agents.md](file:///Users/yb/Dev/ai-rules/global-agents.md) first to align on universal instructions.
+
 # Hermes Agent - Development Guide
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
