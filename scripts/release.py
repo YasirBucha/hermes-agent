@@ -45,6 +45,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    "huanshan5195@users.noreply.github.com": "huanshan5195",  # PR #57601 salvage (custom-provider: emit reasoning_effort at the live CustomProfile path so GLM-5.2/ARK/vLLM/Ollama endpoints receive it; + "max" reasoning level)
     "infinitycrew39@gmail.com": "infinitycrew39",  # PR #56431 salvage (honor live vLLM context limits on local endpoints)
     "jonathan.kovacs999@gmail.com": "CocaKova",  # PR #57692 salvage (cron: run jobs under the profile secret scope so get_secret does not fail-close with UnscopedSecretError under profile isolation)
     "hermes.wanderer@yahoo.com": "trismegistus-wanderer",  # PR #31856 salvage (gateway: defer idle-TTL agent-cache eviction until the session store says the session actually expired, so the expiry watcher can still fire MemoryProvider.on_session_end with the live transcript; #11205)
@@ -1857,6 +1858,7 @@ AUTHOR_MAP = {
     "poli.koltsova@gmail.com": "wnuuee1",  # commit 9fd2b2cb PR author
     "yosapol@jitrak.dev": "Eji4h",  # direct email match
     "kiljadn@gmail.com": "designnotdrum",  # PR #56480 salvage (toolset static-inference fix)
+    "lavya@loom.local": "LavyaTandel",  # PR #57893 salvage local git identity (envelope-layout cache markers on tool/empty-assistant messages; #57845)
 }
 
 
