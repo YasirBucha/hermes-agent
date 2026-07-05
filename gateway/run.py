@@ -1563,6 +1563,16 @@ if _config_path.exists():
                 os.environ["HERMES_GATEWAY_BUSY_TEXT_MODE"] = str(_display_cfg["busy_text_mode"])
             if "busy_ack_enabled" in _display_cfg:
                 os.environ["HERMES_GATEWAY_BUSY_ACK_ENABLED"] = str(_display_cfg["busy_ack_enabled"])
+            # This process-level env var is documented as an override for
+            # service managers, so preserve it when already set. Other display
+            # bridges stay config-authoritative for backwards compatibility.
+            if (
+                "busy_steer_ack_enabled" in _display_cfg
+                and "HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED" not in os.environ
+            ):
+                os.environ["HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED"] = str(
+                    _display_cfg["busy_steer_ack_enabled"]
+                )
         # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
         _tz_cfg = _cfg.get("timezone", "")
         if _tz_cfg and isinstance(_tz_cfg, str):
@@ -5330,20 +5340,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
 
-        # Debounce: only send an acknowledgment once every 30 seconds per session
-        # to avoid spamming the user when they send multiple messages quickly
+        # Debounce before consulting config-heavy display settings. Rapid
+        # follow-ups should be processed but should not trigger another config
+        # read just to discover that no ack will be sent.
         _BUSY_ACK_COOLDOWN = 30
         now = time.time()
         last_ack = self._busy_ack_ts.get(session_key, 0)
         if now - last_ack < _BUSY_ACK_COOLDOWN:
             return True  # interrupt sent (if not queue), ack already delivered recently
 
+        from gateway.display_config import resolve_display_setting
+        platform_key = _platform_config_key(event.source.platform)
+
+        # In steer mode the user's text has already been injected into the
+        # active run. Some mobile chat setups want that steering to be silent,
+        # like STT transcript echo suppression: keep the behavior, drop only
+        # the confirmation bubble.
+        if is_steer_mode:
+            steer_ack_env = os.environ.get("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED")
+            if steer_ack_env is not None:
+                steer_ack_enabled = steer_ack_env.strip().lower() in {"1", "true", "yes", "on"}
+            else:
+                steer_ack_enabled = bool(
+                    resolve_display_setting(
+                        _load_gateway_config(),
+                        platform_key,
+                        "busy_steer_ack_enabled",
+                        True,
+                    )
+                )
+            if not steer_ack_enabled:
+                logger.debug("Busy steer ack suppressed for session %s", session_key)
+                return True
+
         self._busy_ack_ts[session_key] = now
 
         # Build a status-rich acknowledgment. Mobile chat defaults keep this
         # terse; detailed iteration/tool state is still available in logs and
         # can be opted in per platform via display.platforms.<platform>.busy_ack_detail.
-        from gateway.display_config import resolve_display_setting
         status_parts = []
         busy_ack_detail_enabled = bool(
             resolve_display_setting(
@@ -16490,6 +16524,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
+        from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
+        _generic_status_recent: List[str] = []
+        _generic_status_catalog = resolve_status_phrase_catalog(user_config, platform_key)
+
+        def _display_surface_mode(
+            setting: str,
+            *,
+            default: bool = False,
+            require_platform_override_for: set[Any] | None = None,
+            allow_generic: bool = False,
+        ) -> str:
+            """Return off|raw|generic for a gateway visibility surface."""
+            if require_platform_override_for:
+                current_platform = _gateway_platform_value(source.platform)
+                platform_only = {
+                    _gateway_platform_value(item)
+                    for item in require_platform_override_for
+                }
+                if (
+                    current_platform in platform_only
+                    and not _has_platform_display_override(user_config, platform_key, setting)
+                ):
+                    return "off"
+            value = resolve_display_setting(user_config, platform_key, setting, default)
+            if isinstance(value, str) and value.strip().lower() == "generic":
+                return "generic" if allow_generic else "off"
+            return "raw" if bool(value) else "off"
+
+        def _generic_status_phrase(kind: str, *, tool_name: str | None = None, preview: str | None = None, args: Any = None) -> str:
+            try:
+                return choose_status_phrase(
+                    kind,
+                    tool_name=tool_name,
+                    preview=preview,
+                    args=args,
+                    recent=_generic_status_recent,
+                    catalog=_generic_status_catalog,
+                )
+            except Exception as _phrase_err:
+                logger.debug("generic status phrase selection failed: %s", _phrase_err)
+                return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
@@ -16501,29 +16576,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
+        interim_assistant_messages_mode = _display_surface_mode(
+            "interim_assistant_messages",
+            default=True,
+            require_platform_override_for={Platform.MATTERMOST},
+        )
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
-            and _resolve_gateway_display_bool(
-                user_config,
-                platform_key,
-                "interim_assistant_messages",
-                default=True,
-                platform=source.platform,
-                require_platform_override_for={Platform.MATTERMOST},
-            )
+            and interim_assistant_messages_mode != "off"
         )
         # thinking_progress is independent — if enabled, we need the progress
         # queue even when tool_progress is off (thinking relay uses same infra).
         # Mattermost requires a per-platform opt-in: global scratch-text display
         # is too easy to leak into busy public threads.
-        _thinking_enabled = _resolve_gateway_display_bool(
-            user_config,
-            platform_key,
+        _thinking_mode = _display_surface_mode(
             "thinking_progress",
             default=False,
-            platform=source.platform,
             require_platform_override_for={Platform.MATTERMOST},
         )
+        _thinking_enabled = _thinking_mode != "off"
         needs_progress_queue = tool_progress_enabled or _thinking_enabled
 
 
@@ -16687,7 +16758,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
-            
+
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
@@ -17487,18 +17558,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
                     return
+                display_text = text
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
                     else:
-                        _stream_consumer.on_commentary(text)
+                        _stream_consumer.on_commentary(display_text)
                     return
-                if already_streamed or not _status_adapter or not str(text or "").strip():
+                if already_streamed or not _status_adapter or not str(display_text or "").strip():
                     return
                 safe_schedule_threadsafe(
                     _status_adapter.send(
                         _status_chat_id,
-                        text,
+                        display_text,
                         metadata=_status_thread_metadata,
                     ),
                     _loop_for_step,
@@ -18669,14 +18741,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # 0 = disable notifications.
         _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
-        if not bool(
-            resolve_display_setting(
-                user_config,
-                platform_key,
-                "long_running_notifications",
-                True,
-            )
-        ):
+        _long_running_mode = _display_surface_mode(
+            "long_running_notifications",
+            default=True,
+            allow_generic=True,
+        )
+        if _long_running_mode == "off":
             _NOTIFY_INTERVAL = None
         _notify_start = time.time()
 
@@ -18738,7 +18808,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _status_detail = " — " + ", ".join(_parts)
                     except Exception:
                         pass
-                _heartbeat_text = f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                _heartbeat_text = (
+                    _generic_status_phrase("status")
+                    if _long_running_mode == "generic"
+                    else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                )
                 try:
                     _notify_res = None
                     if _heartbeat_msg_id:

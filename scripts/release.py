@@ -45,6 +45,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    "perkintahmaz50@gmail.com": "devatnull",  # PR #58704 salvage (whatsapp: native Baileys polls, clarify-as-poll, location pins, structured quoted replies, PTT/audio split, bridge_helpers extraction)
     "tim@iteachyouai.com": "tjp2021",  # PR #4097 salvage (copilot: per-turn x-initiator header so user prompts bill as premium requests; #3040)
     "3723267+kevinrajaram@users.noreply.github.com": "kevinrajaram",  # PR #3850 salvage (gateway: add POSIX system dirs to PATH so launchctl/systemctl resolve under UV's minimal-PATH bundled Python; #3849)
     "lord-dubious@users.noreply.github.com": "lord-dubious",  # PR #58453 salvage (preserve static custom provider models declared as dict rows)
@@ -273,6 +274,7 @@ AUTHOR_MAP = {
     "290859878+synapsesx@users.noreply.github.com": "synapsesx",
     "157689911+itsflownium@users.noreply.github.com": "itsflownium",
     "dirtyren@users.noreply.github.com": "dirtyren",
+    "perkintahmaz50@gmail.com": "devatnull",
     "marxb@protonmail.com": "Marxb85",
     "153708448+hunjaiboy@users.noreply.github.com": "yyzquwu",  # PR #47567 salvage (Matrix: register inbound handlers with wait_sync=True so _dispatch_sync's gather awaits them; without it mautrix fire-and-forgets and inbound intake has no completion point)
     "jearnest@velocityenergy.com": "jearnest11",  # PR #48700 salvage (multi-profile gateway flap: use node symlink's own parent, not .resolve() target, when building systemd/launchd service PATH so one profile's node path can't leak into every unit and force a perpetual daemon-reload restart loop)
@@ -487,6 +489,7 @@ AUTHOR_MAP = {
     "Rivuza@users.noreply.github.com": "Rivuza",
     "annguyenNous@users.noreply.github.com": "annguyenNous",
     "285874597+annguyenNous@users.noreply.github.com": "annguyenNous",
+    "perkintahmaz50@gmail.com": "devatnull",
     "kylekahraman@users.noreply.github.com": "kylekahraman",
     "130975919+kylekahraman@users.noreply.github.com": "kylekahraman",
     "seppe@fushia.be": "seppegadeyne",
