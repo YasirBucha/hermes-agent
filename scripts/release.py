@@ -45,6 +45,10 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    "doogie@spark.local": "SAMBAS123",  # PR #64986 salvage (gateway: multiplex primary bot token scope)
+    "emrekoca2003@gmail.com": "kocaemre",  # PR #36051 salvage (docs: audit round 3 code/doc reconciliation)
+    "evefromwayback@gmail.com": "evefromwayback",  # PR #64611 salvage (agent: never load install-tree AGENTS.md as project context)
+    "Regina@Andreys-Mini.true.true": "Rival",  # PR #64935/#64936 salvage (state: restore-boundary alternation repair; agent: turn-overlap tripwire)
     "41409874+2751738943@users.noreply.github.com": "2751738943",  # PR #54785 salvage (tui: post-turn completion ownership routing)
     "Burgunthy@users.noreply.github.com": "Burgunthy",  # PR #20096 salvage (gateway: profile-based routing for inbound messages)
     "75556242+webtecnica@users.noreply.github.com": "webtecnica",  # PR #63360 salvage (nous: restore inference-api base_url)
@@ -67,6 +71,7 @@ AUTHOR_MAP = {
     "true@supersynergy.de": "Supersynergy",  # PR #59241 salvage (desktop: workspace path status-bar action)
     "me@roryford.com": "roryford",  # PR #63132 salvage (compression: fail closed for errors from a resolved lock API, preserving lineage)
     "esthon@gmail.com": "esthonjr",  # PR #61950 salvage (desktop: legacy non-git workspace grouping + Windows path identity)
+    "drexux0@gmail.com": "Drexuxux",  # PR #36042 salvage (gateway: /footer reachable mid-run via safe-toggle set)
     "iganapolsky@gmail.com": "IgorGanapolsky",  # PR #62125 salvage (compaction anti-thrash threshold verification)
     "tturney1@gmail.com": "TheTom",  # PR #62696 salvage (gateway: expand @ context references under runtime/session model resolution)
     "wilsonkinyuam@gmail.com": "WilsonKinyua",  # PR #62052 (tui: persist unflushed conversations on disconnect/restart)
@@ -91,6 +96,7 @@ AUTHOR_MAP = {
     "austin@openvm067.space": "austinlaw076",  # PR #57563 partial salvage (auth: lazy per-profile Anthropic OAuth file; gateway: whatsapp_cloud/line added to port-binding platform set)
     "sunsky.lau@gmail.com": "liuhao1024",  # PR #56993 salvage (gateway: process-level HERMES_HOME for pid/lock/status identity files; #56986)
     "roseycomanagement@roseyco.co.uk": "Roseyco-management",  # PR #63581 salvage (telegram: require getUpdates progress before polling is healthy; #63243, #63766)
+    "nima20002000@users.noreply.github.com": "nima20002000",  # PR #36022/#36025 salvage (code-exec truncation metadata; achievements hover loop)
     "gauravsaxena.jaipur@gmail.com": "gauravsaxena1997",  # PR #59868 partial salvage (agent: guard response.text against httpx.ResponseNotRead in _summarize_api_error; #59769)
     "blueirobin02@gmail.com": "irresi",  # PR #59048 salvage (gateway: scope reset banners' session info to the serving profile; #59003)
     "jashlee+microsoft@microsoft.com": "s905060",  # PR #57943 salvage (photon: auto-reinstall stale sidecar node_modules when lockfile is newer than npm's install marker; #59169)
@@ -339,6 +345,7 @@ AUTHOR_MAP = {
     "290859878+synapsesx@users.noreply.github.com": "synapsesx",
     "157689911+itsflownium@users.noreply.github.com": "itsflownium",
     "dirtyren@users.noreply.github.com": "dirtyren",
+    "hi@neueway.com": "brendandebeasi",
     "dorokuma@users.noreply.github.com": "dorokuma",
     "liuwei666888@users.noreply.github.com": "liuwei666888",
     "527711370@qq.com": "liuwei666888",
@@ -1959,6 +1966,7 @@ AUTHOR_MAP = {
     "marvin@photon.codes": "underthestars-zhy",  # PR #46907 co-author (Photon Spectrum project ids)
     "omar@kostudios.io": "OmarB97",  # PR #43977 (desktop session model metadata)
     "omarbaradei21@gmail.com": "OmarB97",  # PR #43977 (desktop session model metadata)
+    "p.fabiszewski@gmail.com": "szafranski",  # PR #36020 (Telegram voice/audio duration)
     "philip.a.dsouza@gmail.com": "PhilipAD",  # direct email match
     "qs2816661685@gmail.com": "qingshan89",  # PR #46895 co-author (desktop remote artifact download)
     "yspdev@gmail.com": "AJ",  # PR #44510 co-author (desktop named-profile boot loop)

@@ -139,7 +139,7 @@ from model_tools import (
     handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
     check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
 )
-from tools.terminal_tool import cleanup_vm
+from tools.terminal_tool import cleanup_vm, get_active_env
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
 
@@ -5768,7 +5768,9 @@ class AIAgent:
                 )
 
             from agent.tool_dispatch_helpers import _plan_tool_batch_segments
-            segments = _plan_tool_batch_segments(tool_calls)
+            _active_env = get_active_env(effective_task_id)
+            _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
+            segments = _plan_tool_batch_segments(tool_calls, execution_cwd=_exec_cwd)
 
             if len(segments) == 1:
                 kind = segments[0][0]
@@ -5920,6 +5922,10 @@ class AIAgent:
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        from agent.aux_accounting import (
+            reset_accounting_context,
+            set_accounting_context,
+        )
         from agent.conversation_loop import run_conversation
         from agent.portal_tags import (
             reset_conversation_context,
@@ -5931,6 +5937,13 @@ class AIAgent:
         # (which copy this Context into their thread) — inherits the
         # ``conversation=<root>`` tag with zero per-call-site plumbing.
         token = set_conversation_context(self._conversation_root_id())
+        # Publish the session accounting handles the same way so auxiliary
+        # calls record their token usage into session_model_usage (task
+        # dimension) — the fix for aux spend being invisible in analytics
+        # (issue #23270).
+        acct_token = set_accounting_context(
+            getattr(self, "_session_db", None), getattr(self, "session_id", None)
+        )
         try:
             return run_conversation(
                 self,
@@ -5944,6 +5957,7 @@ class AIAgent:
                 moa_config=moa_config,
             )
         finally:
+            reset_accounting_context(acct_token)
             reset_conversation_context(token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
