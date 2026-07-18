@@ -1917,6 +1917,12 @@ from gateway.platforms.base import (
     merge_pending_message_event,
     utf16_len,
 )
+from gateway.shutdown_watchdog import (
+    DEFAULT_HEARTBEAT_INTERVAL_S,
+    arm_shutdown_watchdog,
+    loop_heartbeat_forever,
+    resolve_shutdown_watchdog_delay,
+)
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
@@ -2972,6 +2978,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
+    # Loop-liveness heartbeat / shutdown-watchdog handles (#66892). Class-level
+    # defaults so partial construction in tests doesn't blow up on access; the
+    # real values are set in __init__ / start() / stop().
+    _loop_heartbeat_task: Optional["asyncio.Task"] = None
+    _gateway_started_at: float = 0.0
+    _shutdown_watchdog_done: Optional["threading.Event"] = None
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -3296,6 +3308,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+
+        # Event-loop liveness heartbeat (#66892): rewritten every 30s while
+        # the loop is dispatching. External supervisors use the file mtime /
+        # updated_at to distinguish "process alive" from "loop frozen".
+        self._gateway_started_at: float = time.time()
+        self._loop_heartbeat_task: Optional[asyncio.Task] = None
 
         # scale-to-zero (Phase 0, F13): gateway-scoped "last inbound seen" clock.
         # There is no such clock today (only a per-agent _last_activity_ts), so the
@@ -7535,7 +7553,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._running = True
         self._update_runtime_status("running")
-        
+
+        # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
+        # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
+        # other background tasks during stop(). Best-effort — a liveness probe
+        # must never be able to abort startup.
+        try:
+            _existing_hb = getattr(self, "_loop_heartbeat_task", None)
+            if _existing_hb is None or _existing_hb.done():
+                self._loop_heartbeat_task = asyncio.create_task(
+                    loop_heartbeat_forever(
+                        interval_s=DEFAULT_HEARTBEAT_INTERVAL_S,
+                        start_time=getattr(self, "_gateway_started_at", 0.0),
+                    )
+                )
+                _bg = getattr(self, "_background_tasks", None)
+                if _bg is not None:
+                    _bg.add(self._loop_heartbeat_task)
+                    self._loop_heartbeat_task.add_done_callback(_bg.discard)
+        except Exception:
+            logger.debug("Failed to start gateway loop heartbeat", exc_info=True)
+
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
         if hook_count:
@@ -7617,7 +7655,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Process in batches of 100 with event-loop yield points to avoid
             # O(n^2) event-loop blocking when recovering thousands of watchers.
             for i, watcher in enumerate(watchers):
-                asyncio.create_task(self._run_process_watcher(watcher))
+                self._spawn_supervised(
+                    lambda w=watcher: self._run_process_watcher(w),
+                    f"process_watcher:{watcher.get('session_id')}",
+                    restart=False,
+                )
                 logger.info("Resumed watcher for recovered process %s", watcher.get("session_id"))
                 if i % 100 == 99:
                     await asyncio.sleep(0)
@@ -7625,18 +7667,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.error("Recovered watcher setup error: %s", e)
 
         # Start background session expiry watcher to finalize expired sessions
-        asyncio.create_task(self._session_expiry_watcher())
+        self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
 
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
         # so human-in-the-loop workflows hear back without polling.
-        asyncio.create_task(self._kanban_notifier_watcher())
+        self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
 
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
         # When false, users run `hermes kanban daemon` externally or
         # simply don't use kanban; this loop becomes a no-op.
-        asyncio.create_task(self._kanban_dispatcher_watcher())
+        self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
@@ -7645,19 +7687,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 len(self._failed_platforms),
                 ", ".join(p.value for p in self._failed_platforms),
             )
-        asyncio.create_task(self._platform_reconnect_watcher())
+        self._spawn_supervised(self._platform_reconnect_watcher, "platform_reconnect_watcher")
 
         # Start background handoff watcher — picks up CLI sessions marked
         # handoff_state='pending' in state.db and re-binds them to the
         # destination platform's home channel, then forges a synthetic user
         # turn so the agent kicks off the new chat.
-        asyncio.create_task(self._handoff_watcher())
+        self._spawn_supervised(self._handoff_watcher, "handoff_watcher")
 
         # Start background async-delegation watcher — drains completion events
         # from delegate_task(background=true) subagents and injects each
         # result back into its originating session as a new turn, covering the
         # idle case where the subagent finishes with no agent turn running.
-        asyncio.create_task(self._async_delegation_watcher())
+        self._spawn_supervised(self._async_delegation_watcher, "async_delegation_watcher")
 
         # Start the scale-to-zero idle watcher ONLY when this instance is opted
         # in (the NAS "Labs" HERMES_SCALE_TO_ZERO stamp), messaging is
@@ -7671,7 +7713,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "scale-to-zero: armed (idle timeout %.0fs) — watching for idle",
                     self._scale_to_zero_idle_timeout_seconds(),
                 )
-                asyncio.create_task(self._scale_to_zero_watcher())
+                self._spawn_supervised(self._scale_to_zero_watcher, "scale_to_zero_watcher")
             else:
                 # Surface WHY an OPTED-IN instance didn't arm (a non-opted instance
                 # not arming is normal — stay silent there). Without this, a failed
@@ -7686,11 +7728,99 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # left behind by a prior instantiation (durable-volume restart, NS-570)
         # is ignored via its instantiation epoch; only a current-epoch marker
         # engages drain on the first tick.
-        asyncio.create_task(self._drain_control_watcher())
+        self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
 
         logger.info("Press Ctrl+C to stop")
         
         return True
+
+    _MAX_SUPERVISED_RESTARTS = 5
+    # A task that ran at least this long before crashing is treated as having
+    # been HEALTHY — its crash is a fresh, isolated failure rather than part of
+    # a rapid crash-loop, so the consecutive-restart counter resets to 0. Only
+    # crashes that happen within this window of a (re)spawn accumulate toward
+    # ``_MAX_SUPERVISED_RESTARTS``. Without this, a long-lived launchd daemon
+    # whose watcher crashes a handful of times over days would hit the cap and
+    # be permanently abandoned (NS: silent loss of platform-reconnect / kanban /
+    # handoff for the rest of the process life).
+    _SUPERVISED_HEALTHY_SECS = 300
+
+    def _spawn_supervised(self, coro_factory, name, *, restart=True, _attempt=0):
+        """Launch a long-lived background task with task-level supervision.
+
+        Complements upstream's per-iteration inner-loop try/except (which only
+        guards a single loop-body) by covering what that CANNOT: an exception
+        raised in the watcher's OUTER ``while self._running:`` loop or its
+        pre-try setup region, plus task-level death generally. A bare
+        ``asyncio.create_task`` drops such an exception on the floor — no log,
+        no restart, the watcher silently gone. This retains the handle in
+        ``self._background_tasks``, logs any crash, and restarts with capped
+        exponential backoff up to ``_MAX_SUPERVISED_RESTARTS`` failures in rapid
+        succession (each within ``_SUPERVISED_HEALTHY_SECS`` of its restart).
+        The counter resets after any run that stayed healthy for at least
+        ``_SUPERVISED_HEALTHY_SECS`` — so a long-lived daemon that crashes
+        occasionally over days is never permanently abandoned.
+        """
+        if getattr(self, "_background_tasks", None) is None:
+            self._background_tasks = set()
+
+        # Monotonic spawn timestamp captured per spawn: the ``_done`` callback
+        # uses it to distinguish a rapid crash-loop from a healthy-run-then-crash.
+        _started = time.monotonic()
+
+        # Deliberately do NOT pass name= to create_task — some test doubles mock
+        # create_task with a signature that rejects the name kwarg.
+        task = asyncio.create_task(coro_factory())
+        self._background_tasks.add(task)
+
+        def _done(t):
+            self._background_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is None:
+                # Clean return == deliberate shutdown or a self-disabling watcher
+                # (e.g. a gated no-op that returns synchronously). Respawning here
+                # would busy-spin such a watcher — so NEVER restart on clean exit.
+                return
+            logger.error("Supervised task %s died: %r", name, exc, exc_info=exc)
+            if restart and self._running:
+                ran_for = time.monotonic() - _started
+                if ran_for >= self._SUPERVISED_HEALTHY_SECS:
+                    # Ran healthily for a while before crashing — this is a
+                    # FRESH failure, not part of a rapid crash-loop. Reset the
+                    # consecutive counter so a daemon that crashes a handful of
+                    # times over days is never permanently abandoned.
+                    effective_attempt = 0
+                else:
+                    effective_attempt = _attempt
+                if effective_attempt >= self._MAX_SUPERVISED_RESTARTS:
+                    logger.error(
+                        "Supervised task %s died %d times in rapid succession "
+                        "(each within %ds of restart) — giving up restarts",
+                        name,
+                        effective_attempt,
+                        self._SUPERVISED_HEALTHY_SECS,
+                    )
+                    return
+                backoff = min(60, 2 ** min(effective_attempt, 6))
+
+                async def _respawn():
+                    await asyncio.sleep(backoff)
+                    if self._running:
+                        self._spawn_supervised(
+                            coro_factory,
+                            name,
+                            restart=restart,
+                            _attempt=effective_attempt + 1,
+                        )
+
+                respawn_task = asyncio.create_task(_respawn())
+                self._background_tasks.add(respawn_task)
+                respawn_task.add_done_callback(self._background_tasks.discard)
+
+        task.add_done_callback(_done)
+        return task
 
     async def _handoff_watcher(self, interval: float = 2.0) -> None:
         """Background task that processes pending CLI→gateway session handoffs.
@@ -8407,11 +8537,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as _e:
                     logger.debug("cleanup_all_browsers (%s) error: %s", phase, _e)
 
+            # Thread-based shutdown watchdog (#66892): asyncio timeouts cannot
+            # recover a frozen loop. Arm a plain OS thread at the start of
+            # stop(); if teardown never finishes within drain+grace it dumps
+            # faulthandler stacks and os._exit so KeepAlive/systemd can revive.
+            # Skip under pytest so stop()-driving unit tests don't get a
+            # delayed hard-exit in the worker.
+            _watchdog_done = threading.Event()
+            self._shutdown_watchdog_done = _watchdog_done
+            _stop_started_at_box: dict[str, float] = {}
+
+            def _shutdown_watchdog_snapshot() -> dict:
+                started = _stop_started_at_box.get("t")
+                return {
+                    "restart_requested": bool(self._restart_requested),
+                    "draining": bool(self._draining),
+                    "running": bool(self._running),
+                    "active_agents": self._running_agent_count(),
+                    "active_cron_jobs": self._active_cron_job_count(),
+                    "active_api_runs": self._active_api_run_count(),
+                    "restart_drain_timeout": self._restart_drain_timeout,
+                    "watchdog_delay_s": resolve_shutdown_watchdog_delay(
+                        self._restart_drain_timeout
+                    ),
+                    "phase_elapsed_s": (
+                        time.monotonic() - started if started is not None else None
+                    ),
+                }
+
+            if not os.environ.get("PYTEST_CURRENT_TEST"):
+                arm_shutdown_watchdog(
+                    resolve_shutdown_watchdog_delay(self._restart_drain_timeout),
+                    done_event=_watchdog_done,
+                    snapshot_fn=_shutdown_watchdog_snapshot,
+                    exit_code=1,
+                )
+
+            try:
+                await _stop_impl_body(
+                    _kill_tool_subprocesses,
+                    _stop_started_at_box,
+                )
+            finally:
+                _watchdog_done.set()
+
+        async def _stop_impl_body(_kill_tool_subprocesses, _stop_started_at_box) -> None:
             logger.info(
                 "Stopping gateway%s...",
                 " for restart" if self._restart_requested else "",
             )
             _stop_started_at = time.monotonic()
+            _stop_started_at_box["t"] = _stop_started_at
 
             def _phase_elapsed() -> float:
                 return time.monotonic() - _stop_started_at
