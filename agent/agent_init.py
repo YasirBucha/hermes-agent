@@ -1561,7 +1561,14 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    if not skip_memory:
+    # A flush/background agent may pass skip_memory=True to avoid spinning up an
+    # external memory *provider*, but if the caller also explicitly enables the
+    # "memory" toolset it still needs the built-in file-backed store — otherwise
+    # the memory tool dispatches with store=None and every call fails (#65429).
+    # So the built-in store is created unless memory is globally disabled, while
+    # the external-provider block below stays gated on skip_memory.
+    _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
+    if not skip_memory or _memory_toolset_requested:
         try:
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
@@ -1821,6 +1828,17 @@ def init_agent(
     compression_abort_on_summary_failure = str(
         _compression_cfg.get("abort_on_summary_failure", False)
     ).lower() in {"true", "1", "yes"}
+    # Per-model threshold overrides: keys are substring-matched against the
+    # model name (longest match wins). Empty dict = use the global threshold
+    # for all models (backward compatible).
+    _raw_model_thresholds = _compression_cfg.get("model_thresholds", {})
+    if isinstance(_raw_model_thresholds, dict):
+        compression_model_thresholds = {
+            str(k): float(v) for k, v in _raw_model_thresholds.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+    else:
+        compression_model_thresholds = {}
     # In-place compaction: when True, compress_context() rewrites the message
     # list + rebuilds the system prompt WITHOUT rotating the session id (no
     # parent_session_id chain, no `name #N` renumber). See #38763 and
@@ -2216,6 +2234,16 @@ def init_agent(
             provider=agent.provider,
             custom_providers=_custom_providers,
         )
+        # Per-model threshold overrides are part of the explicit
+        # context-engine contract: assign them BEFORE the initial
+        # update_model() call so the first resolution (which derives
+        # threshold_percent/threshold_tokens for the initial model) already
+        # sees the overrides. Assigning after update_model() left the initial
+        # model on the engine's global threshold until the first /model
+        # switch. Engines that override update_model() own their own policy
+        # and may ignore the attribute.
+        if compression_model_thresholds:
+            agent.context_compressor.model_thresholds = compression_model_thresholds
         agent.context_compressor.update_model(
             model=agent.model,
             context_length=_plugin_ctx_len,
@@ -2242,6 +2270,7 @@ def init_agent(
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
             max_tokens=agent.max_tokens,
+            model_thresholds=compression_model_thresholds,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
