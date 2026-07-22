@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -419,6 +420,194 @@ def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch
     assert ad.get_durable_delegation("deleg_claim")["delivery_state"] == "delivered"
 
 
+def test_deterministic_idempotency_suppresses_duplicate_runner(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    gate = threading.Event()
+    calls = []
+
+    def runner():
+        calls.append("ran")
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    kwargs = {
+        "goal": "same work", "context": "same context", "toolsets": None,
+        "role": "leaf", "model": "m", "session_key": "owner",
+        "runner": runner, "idempotency_key": "stable-request-42",
+    }
+    first = ad.dispatch_async_delegation(**kwargs)
+    duplicate = ad.dispatch_async_delegation(**kwargs)
+    conflict = ad.dispatch_async_delegation(**{**kwargs, "goal": "different work"})
+
+    assert first["status"] == "dispatched"
+    assert duplicate == {
+        "status": "dispatched",
+        "delegation_id": first["delegation_id"],
+        "state": "running",
+        "idempotent_replay": True,
+    }
+    assert conflict["status"] == "rejected"
+    assert conflict["reason"] == "idempotency_conflict"
+    assert conflict["delegation_id"] == first["delegation_id"]
+    gate.set()
+    assert _drain_for(first["delegation_id"]) is not None
+    assert calls == ["ran"]
+    audit_types = [item["event_type"] for item in ad.get_delegation_audit(first["delegation_id"])]
+    assert audit_types[:3] == ["dispatched", "duplicate_suppressed", "dispatch_conflict"]
+
+
+def test_agentbroker_token_file_accepts_owner_only_raw_and_dotenv_files(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.delenv("BROKER_TOKEN", raising=False)
+    token_file = tmp_path / "broker.token"
+    token_file.write_text("x" * 64, encoding="utf-8")
+    token_file.chmod(0o600)
+    monkeypatch.setenv("BROKER_TOKEN_FILE", str(token_file))
+    assert ad._agentbroker_token() == "x" * 64
+
+    dotenv_file = tmp_path / "agentbroker.env"
+    dotenv_file.write_text(
+        "BROKER_HOST=127.0.0.1\nBROKER_TOKEN='" + "y" * 64 + "'\n",
+        encoding="utf-8",
+    )
+    dotenv_file.chmod(0o600)
+    monkeypatch.setenv("BROKER_TOKEN_FILE", str(dotenv_file))
+    assert ad._agentbroker_token() == "y" * 64
+
+
+def test_agentbroker_token_file_rejects_insecure_permissions(tmp_path, monkeypatch):
+    monkeypatch.delenv("BROKER_TOKEN", raising=False)
+    token_file = tmp_path / "broker.token"
+    token_file.write_text("x" * 64, encoding="utf-8")
+    token_file.chmod(0o644)
+    monkeypatch.setenv("BROKER_TOKEN_FILE", str(token_file))
+    assert ad._agentbroker_token() == ""
+
+
+def test_timeout_escalates_once_to_approval_gated_agentbroker_and_refreshes_receipt(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("BROKER_TOKEN", "x" * 64)
+    secret = "github_pat_abcdefghijklmnopqrstuvwxyz1234567890"
+    submitted = []
+
+    def fake_submit(payload):
+        submitted.append(payload)
+        return {
+            "task_id": payload["task_id"],
+            "status": "waiting_approval",
+            "idempotent_replay": False,
+        }
+
+    monkeypatch.setattr(ad, "_submit_agentbroker_task", fake_submit)
+    dispatched = ad.dispatch_async_delegation(
+        goal="timed work", context=None, toolsets=None, role="leaf", model="m",
+        session_key="owner", idempotency_key="timeout-request",
+        runner=lambda: {
+            "status": "timeout", "summary": None,
+            "error": f"provider token {secret}", "exit_reason": "timeout",
+        },
+    )
+    event = _drain_for(dispatched["delegation_id"])
+
+    assert event["status"] == "timeout"
+    assert event["escalation"]["state"] == "submitted"
+    assert len(submitted) == 1
+    request = submitted[0]
+    assert request["requesting_agent"] == "hermes-manager"
+    assert request["target_agent"] == "qa-agent"
+    assert request["task_type"] == "code_qa"
+    assert request["permission_level"] == "read_only"
+    assert request["human_approval_required"] is True
+    assert request["allowed_scope"] == "/Users/yb/AI/HermesWork"
+    assert secret not in json.dumps(request)
+
+    task_id = request["task_id"]
+
+    def fake_fetch(path):
+        if path.endswith("/receipt"):
+            return {"task_id": task_id, "status": "completed", "result": {"ok": True}}
+        return {"task_id": task_id, "status": "completed"}
+
+    receipt = ad.get_delegation_receipt(
+        dispatched["delegation_id"], refresh=True, fetcher=fake_fetch
+    )
+    status = ad.get_durable_delegation(dispatched["delegation_id"])
+    assert receipt["task"]["status"] == "completed"
+    assert receipt["receipt"]["result"] == {"ok": True}
+    assert status["escalation"]["task_id"] == task_id
+    assert status["receipt"] == receipt
+    assert secret not in json.dumps(ad.get_delegation_audit(dispatched["delegation_id"]))
+
+
+def test_agentbroker_submission_retry_is_bounded(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    dispatched = ad.dispatch_async_delegation(
+        goal="will fail", context=None, toolsets=None, role="leaf", model="m",
+        session_key="owner", idempotency_key="bounded-retry",
+        escalation_max_attempts=3,
+        runner=lambda: {"status": "error", "error": "temporary failure"},
+    )
+    assert _drain_for(dispatched["delegation_id"]) is not None
+
+    calls = []
+
+    def unavailable(_payload):
+        calls.append("attempt")
+        raise RuntimeError("broker offline")
+
+    base = time.time() + 10
+    assert ad.process_pending_escalations(
+        submitter=unavailable, now=base, delegation_id=dispatched["delegation_id"]
+    ) == 1
+    assert ad.process_pending_escalations(
+        submitter=unavailable, now=base + 2, delegation_id=dispatched["delegation_id"]
+    ) == 1
+    assert ad.process_pending_escalations(
+        submitter=unavailable, now=base + 5, delegation_id=dispatched["delegation_id"]
+    ) == 1
+    assert ad.process_pending_escalations(
+        submitter=unavailable, now=base + 100, delegation_id=dispatched["delegation_id"]
+    ) == 0
+    assert calls == ["attempt", "attempt", "attempt"]
+    status = ad.get_durable_delegation(dispatched["delegation_id"])
+    assert status["escalation"]["state"] == "exhausted"
+    assert status["escalation"]["attempts"] == 3
+
+
+def test_expired_live_owner_lease_recovers_and_escalates(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "deleg_expired_lease",
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": "parent",
+        "goal": "recover me",
+        "dispatched_at": time.time(),
+    }
+    ad._persist_dispatch(record)
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET lease_expires_at=? WHERE delegation_id=?",
+            (time.time() - 1, record["delegation_id"]),
+        )
+
+    submitted = []
+
+    def fake_submit(payload):
+        submitted.append(payload)
+        return {"task_id": payload["task_id"], "status": "waiting_approval"}
+
+    assert ad.recover_abandoned_delegations(escalation_submitter=fake_submit) == 1
+    status = ad.get_durable_delegation(record["delegation_id"])
+    assert status["state"] == "unknown"
+    assert status["lease_expires_at"] is None
+    assert status["escalation"]["state"] == "submitted"
+    assert len(submitted) == 1
+
+
 # ---------------------------------------------------------------------------
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------
@@ -485,6 +674,80 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
+
+
+def test_delegate_task_replay_suppresses_execution_and_conflict_fails_closed(
+    monkeypatch,
+):
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess-replay"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    children = []
+    calls = []
+    gate = threading.Event()
+
+    def build_child(**_kwargs):
+        child = MagicMock()
+        child._delegate_role = "leaf"
+        child._subagent_id = f"child-{len(children)}"
+        child.tool_progress_callback = None
+        children.append(child)
+        return child
+
+    def slow_child(task_index, goal, child=None, parent_agent=None, **_kwargs):
+        calls.append(goal)
+        gate.wait(timeout=60)
+        return {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "m",
+            "exit_reason": "completed",
+        }
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", build_child)
+    monkeypatch.setattr(dt, "_run_single_child", slow_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+
+    first = json.loads(dt.delegate_task(
+        goal="same goal", background=True, parent_agent=parent,
+        idempotency_key="sess-replay:tool-1",
+    ))
+    live_path = Path(first["live_transcripts"][0])
+    with live_path.open("a", encoding="utf-8") as fh:
+        fh.write("sentinel original run\n")
+    replay = json.loads(dt.delegate_task(
+        goal="same goal", background=True, parent_agent=parent,
+        idempotency_key="sess-replay:tool-1",
+    ))
+    conflict = json.loads(dt.delegate_task(
+        goal="different goal", background=True, parent_agent=parent,
+        idempotency_key="sess-replay:tool-1",
+    ))
+
+    assert replay["idempotent_replay"] is True
+    assert replay["delegation_id"] == first["delegation_id"]
+    assert "idempotency key conflicts" in conflict["error"]
+    assert "sentinel original run" in live_path.read_text(encoding="utf-8")
+    assert "different goal" not in live_path.read_text(encoding="utf-8")
+    assert children[1].close.called
+    assert children[2].close.called
+
+    gate.set()
+    assert _drain_for(first["delegation_id"]) is not None
+    assert calls == ["same goal"]
 
 
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
@@ -668,8 +931,11 @@ def test_run_agent_dispatch_forces_background():
 
     with patch("tools.delegate_tool.delegate_task", _fake_delegate):
         agent = _FakeAgent()
-        run_agent.AIAgent._dispatch_delegate_task(agent, {"goal": "x"})
+        run_agent.AIAgent._dispatch_delegate_task(
+            agent, {"goal": "x", "_idempotency_key": "session:tool-call-1"}
+        )
         assert captured["background"] is True
+        assert captured["idempotency_key"] == "session:tool-call-1"
 
         run_agent.AIAgent._dispatch_delegate_task(
             agent, {"tasks": [{"goal": "a"}, {"goal": "b"}]}
@@ -738,10 +1004,12 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
         "model": "m", "provider": None, "base_url": None, "api_key": None,
         "api_mode": None, "command": None, "args": None,
     }
-    with patch.object(dt, "_build_child_agent", side_effect=build_and_register), \
-         patch.object(dt, "_run_single_child", side_effect=slow_child), \
-         patch.object(dt, "_resolve_delegation_credentials", return_value=creds):
-        out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
+    # These patches must outlive delegate_task(): the detached worker resolves
+    # the module globals after the dispatch handle has already returned.
+    monkeypatch.setattr(dt, "_build_child_agent", build_and_register)
+    monkeypatch.setattr(dt, "_run_single_child", slow_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
 
     import json
     assert json.loads(out)["status"] == "dispatched"
@@ -871,5 +1139,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
-

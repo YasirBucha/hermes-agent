@@ -764,6 +764,9 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
 | `HERMES_AGENT_HELP_GUIDANCE` | Append additional guidance text to the system prompt for custom deployments. |
 | `HERMES_AGENT_LOGO` | Override the ASCII banner logo at CLI startup. |
 | `DELEGATION_MAX_CONCURRENT_CHILDREN` | Max parallel subagents per `delegate_task` batch (default: `3`, floor of 1, no ceiling). Also configurable via `delegation.max_concurrent_children` in `config.yaml` — the config value takes priority. |
+| `BROKER_TOKEN` | AgentBroker producer credential used only to submit deterministic, approval-gated recovery tasks for failed, timed-out, or abandoned background delegations. |
+| `BROKER_TOKEN_FILE` | Optional absolute path to an owner-only file containing either the raw producer credential or an exact `BROKER_TOKEN=...` dotenv entry. `BROKER_TOKEN` takes precedence. |
+| `AGENTBROKER_URL` | Optional AgentBroker URL override (default: `http://127.0.0.1:8765`). Hermes accepts loopback HTTP addresses only. |
 
 ### HERMES_WRITE_SAFE_ROOT {#hermes_write_safe_root}
 

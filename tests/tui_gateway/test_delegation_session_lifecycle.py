@@ -22,6 +22,7 @@ import tools.async_delegation as ad
 from tui_gateway.server import (
     _finalize_session,
     _session_owns_notification_event,
+    handle_request,
 )
 
 
@@ -106,6 +107,37 @@ class TestInterruptForSession:
         fn = self._seed_record("d1", session_key="sess_A", status="completed")
         assert ad.interrupt_for_session(session_key="sess_A") == 0
         fn.assert_not_called()
+
+
+class TestDurableDelegationStatusRpc:
+    def test_queries_status_and_optional_agentbroker_receipt(self):
+        durable = {"delegation_id": "deleg_x", "state": "error", "receipt": None}
+        receipt = {"task": {"status": "completed"}, "receipt": {"ok": True}}
+        with patch("tools.async_delegation.get_delegation_status", return_value=durable), \
+             patch("tools.async_delegation.get_delegation_receipt", return_value=receipt) as get_receipt:
+            response = handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "1",
+                    "method": "delegation.status",
+                    "params": {"delegation_id": "deleg_x", "refresh_receipt": True},
+                }
+            )
+
+        assert response["result"]["receipt"] == receipt
+        get_receipt.assert_called_once_with("deleg_x", refresh=True)
+
+    def test_unknown_durable_delegation_fails_closed(self):
+        with patch("tools.async_delegation.get_delegation_status", return_value=None):
+            response = handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "1",
+                    "method": "delegation.status",
+                    "params": {"delegation_id": "missing"},
+                }
+            )
+        assert response["error"] == {"code": 4040, "message": "delegation not found"}
 
 
 class TestFinalizeInterruptsOwnDelegations:

@@ -1411,6 +1411,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _delegate_result = None
             try:
                 def _execute(next_args: dict) -> Any:
+                    next_args = dict(next_args)
+                    tool_call_id = str(getattr(tool_call, "id", "") or "")
+                    if tool_call_id:
+                        next_args["_idempotency_key"] = (
+                            f"{getattr(agent, 'session_id', '')}:{tool_call_id}"
+                        )
                     return agent._dispatch_delegate_task(next_args)
                 function_result, function_args = _run_agent_tool_execution_middleware(
                     agent,

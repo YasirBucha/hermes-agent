@@ -139,9 +139,19 @@ class LiveTranscriptWriter:
                 "(append-only; streams while the subagent runs — tail -f me)",
                 "=" * 40,
             ]
-            self.path.write_text("\n".join(header) + "\n", encoding="utf-8")
-            self.event("user", "kickoff: " + _one_line(goal, _KICKOFF_MAX)
-                       + (f" | context: {_one_line(context, _KICKOFF_MAX)}" if context else ""))
+            created = False
+            try:
+                # Stable idempotency keys intentionally reuse the same live
+                # transcript path.  Exclusive creation preserves the original
+                # append-only audit trail when a request is replayed.
+                with self.path.open("x", encoding="utf-8") as fh:
+                    fh.write("\n".join(header) + "\n")
+                created = True
+            except FileExistsError:
+                pass
+            if created:
+                self.event("user", "kickoff: " + _one_line(goal, _KICKOFF_MAX)
+                           + (f" | context: {_one_line(context, _KICKOFF_MAX)}" if context else ""))
         except Exception as exc:
             logger.debug("Live transcript init failed (%s task %s): %s",
                          delegation_id, task_index, exc)
@@ -339,7 +349,10 @@ def create_live_transcripts(
                 paths.append(str(w.path))
         if not paths:
             return None, [None] * n, []
-        _write_manifest(deleg_id, task_list, paths)
+        # A replay of the same stable delegation id must not reset a terminal
+        # manifest to "running" or replace its original task metadata.
+        if not _manifest_path(deleg_id).exists():
+            _write_manifest(deleg_id, task_list, paths)
         return deleg_id, writers, paths
     except Exception as exc:
         logger.debug("Live transcript creation failed: %s", exc)

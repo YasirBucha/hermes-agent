@@ -973,7 +973,26 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     owner_started_at INTEGER,
     task_json TEXT,
     delivery_claim TEXT,
-    delivery_claimed_at REAL
+    delivery_claimed_at REAL,
+    idempotency_key TEXT,
+    request_fingerprint TEXT,
+    lease_expires_at REAL,
+    escalation_state TEXT NOT NULL DEFAULT 'not_required',
+    escalation_attempts INTEGER NOT NULL DEFAULT 0,
+    escalation_max_attempts INTEGER NOT NULL DEFAULT 3,
+    escalation_next_at REAL,
+    escalation_reason TEXT,
+    escalation_task_id TEXT,
+    escalation_error TEXT,
+    receipt_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS async_delegation_audit (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    delegation_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    data_json TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -986,6 +1005,8 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+CREATE INDEX IF NOT EXISTS idx_async_delegation_audit_parent
+    ON async_delegation_audit(delegation_id, event_id);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -1003,6 +1024,11 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_async_delegations_idempotency
+    ON async_delegations(idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_async_delegations_escalation
+    ON async_delegations(escalation_state, escalation_next_at);
 """
 
 FTS_SQL = """

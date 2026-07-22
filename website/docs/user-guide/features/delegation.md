@@ -135,10 +135,27 @@ consumers use a durable claim, so only the consumer that successfully accepts
 the synthetic turn acknowledges delivery; failed attempts release the claim for
 retry.
 
-This does not resume child execution after a crash. A delegation whose owner
-process disappears while it is still running is recorded as `unknown`, because
-Hermes cannot prove whether its external side effects happened. Pending and
-delivered records are bounded and profile-local.
+Hermes also persists a deterministic idempotency key, request fingerprint, and
+renewable owner lease for each background unit. Duplicate dispatch retries with
+the same key return the original handle and never start a second child. If the
+owner process disappears or its lease expires, Hermes records the outcome as
+`unknown`; it never replays the child closure because external side effects
+cannot be proven safe.
+
+Failed, timed-out, and `unknown` delegations create one deterministic,
+approval-gated, read-only recovery task through the existing local AgentBroker
+contract. Broker submission retries are bounded and persisted across restart.
+The recovery request contains redacted diagnostic metadata only and asks for a
+safe recommendation, not consequential execution. If AgentBroker credentials
+are unavailable, the escalation remains `pending` for a later retry. Hermes uses
+the AgentBroker producer credential in `BROKER_TOKEN` and defaults to
+`http://127.0.0.1:8765`; `AGENTBROKER_URL` may override this only with another
+loopback HTTP address. Pending and delivered records are bounded and
+profile-local.
+
+The desktop gateway can query a durable record with
+`delegation.status({"delegation_id": "deleg_..."})`. Add
+`"refresh_receipt": true` to refresh its AgentBroker task and receipt snapshot.
 
 ## Model Override
 

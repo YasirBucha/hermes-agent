@@ -1,0 +1,29 @@
+{
+  "id": "Hermes",
+  "name": "Hermes Agent",
+  "version": 1,
+  "brainCoreRegistry": "/Users/yb/Dev/projects/BrainCore/config/connected-apps.json",
+  "sharedStorage": "/Users/yb/Dev/projects/BrainCore/config/shared-storage.json",
+  "role": "delegation_recommendation_and_notification_agent",
+  "exports": [
+    "analysis",
+    "recommendation",
+    "notification"
+  ],
+  "imports": [
+    "email",
+    "thread",
+    "task",
+    "decision",
+    "memory",
+    "note",
+    "metric",
+    "alert"
+  ],
+  "routes": {
+    "fromBrainCore": "compose source-backed briefs and recommendations from scoped ecosystem context",
+    "fromAgentBroker": "perform scheduled or delegated read-only work and return durable receipts",
+    "toTony": "deliver concise executive recommendations and escalation notices",
+    "toOpenClaw": "request approval-gated local execution through AgentBroker only"
+  }
+}

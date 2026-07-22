@@ -160,6 +160,10 @@ scripts/out/
 # committed to the repo root. See the hermes-release skill.
 RELEASE_v*.md
 
+# Regenerable local Graphify artifacts. Keep the compact report and manifest.
+graphify-out/cache/
+graphify-out/graph.json
+
 # Desktop demo-run scratch output (hermes writes demo/*.txt during recorded
 # walkthroughs). Throwaway artifacts, never part of the app.
 apps/desktop/demo/

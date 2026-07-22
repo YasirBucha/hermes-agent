@@ -9307,6 +9307,25 @@ def _(rid, params: dict) -> dict:
 
 @method("delegation.status")
 def _(rid, params: dict) -> dict:
+    delegation_id = str(params.get("delegation_id") or "").strip()
+    if delegation_id:
+        from tools.async_delegation import (
+            get_delegation_receipt,
+            get_delegation_status,
+        )
+
+        status = get_delegation_status(delegation_id)
+        if status is None:
+            return _err(rid, 4040, "delegation not found")
+        if bool(params.get("refresh_receipt")):
+            try:
+                status["receipt"] = get_delegation_receipt(
+                    delegation_id, refresh=True
+                )
+            except Exception:
+                status["receipt_refresh_error"] = "AgentBroker receipt unavailable"
+        return _ok(rid, status)
+
     from tools.delegate_tool import (
         is_spawn_paused,
         list_active_subagents,

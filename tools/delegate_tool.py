@@ -2431,6 +2431,7 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    idempotency_key: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2566,8 +2567,13 @@ def delegate_task(
         wrap_progress_callback,
     )
 
+    _stable_live_id = None
+    if idempotency_key:
+        from tools.async_delegation import _delegation_id_for_key
+
+        _stable_live_id = _delegation_id_for_key(str(idempotency_key))
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context
+        task_list, context, delegation_id=_stable_live_id
     )
 
     # Save parent tool names BEFORE any child construction mutates the global.
@@ -3016,22 +3022,43 @@ def delegate_task(
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
+            idempotency_key=idempotency_key,
         )
 
+        def _close_unstarted_children() -> None:
+            for _child in _child_agents:
+                try:
+                    if hasattr(_child, "close"):
+                        _child.close()
+                except Exception:
+                    logger.debug(
+                        "Failed to close child after suppressed async dispatch",
+                        exc_info=True,
+                    )
+
         if dispatch.get("status") == "dispatched":
+            if dispatch.get("idempotent_replay"):
+                _close_unstarted_children()
             n = len(_goals)
-            note = (
-                "Subagent is running in the background. You and the user can "
-                "keep working; its full result re-enters the conversation as a "
-                "new message when it finishes. Do not wait or poll — just "
-                "continue."
-                if n == 1 else
-                f"{n} subagents are running in parallel in the background. You "
-                f"and the user can keep working; they wait on each other and "
-                f"their consolidated results re-enter the conversation as a "
-                f"single message once ALL of them finish. Do not wait or poll "
-                f"— just continue."
-            )
+            if dispatch.get("idempotent_replay"):
+                note = (
+                    "This delegation request was already accepted; no duplicate "
+                    "subagent was started. Query delegation.status with the "
+                    "delegation_id for its durable state and receipt."
+                )
+            else:
+                note = (
+                    "Subagent is running in the background. You and the user can "
+                    "keep working; its full result re-enters the conversation as a "
+                    "new message when it finishes. Do not wait or poll — just "
+                    "continue."
+                    if n == 1 else
+                    f"{n} subagents are running in parallel in the background. You "
+                    f"and the user can keep working; they wait on each other and "
+                    f"their consolidated results re-enter the conversation as a "
+                    f"single message once ALL of them finish. Do not wait or poll "
+                    f"— just continue."
+                )
             payload = {
                 "status": "dispatched",
                 "mode": "background",
@@ -3040,6 +3067,9 @@ def delegate_task(
                 "goals": _goals,
                 "note": note,
             }
+            if dispatch.get("idempotent_replay"):
+                payload["idempotent_replay"] = True
+                payload["state"] = dispatch.get("state")
             if live_paths:
                 payload["live_transcripts"] = list(live_paths)
                 payload["live_transcripts_hint"] = (
@@ -3049,6 +3079,10 @@ def delegate_task(
                     "a child work while it runs."
                 )
             return json.dumps(payload, ensure_ascii=False)
+
+        if dispatch.get("reason") == "idempotency_conflict":
+            _close_unstarted_children()
+            return tool_error(str(dispatch.get("error") or "Idempotency conflict."))
 
         # Pool at capacity / schedule failure — children are still attached
         # (we detach above only on the parent list, but the async unit was

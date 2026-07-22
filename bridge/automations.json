@@ -1,0 +1,113 @@
+{
+  "appId": "Hermes",
+  "name": "Hermes Agent",
+  "version": 1,
+  "updatedAt": "2026-07-22T00:00:00+01:00",
+  "brainCoreAutomationMatrix": "/Users/yb/Dev/projects/BrainCore/config/ecosystem-automations.json",
+  "approvalModel": "AgentBroker approval is required before consequential actions; Hermes remains recommendation, scheduling, and notification only.",
+  "automations": [
+    {
+      "id": "auto-graph-intelligence-radar",
+      "ideaId": "graph-intelligence-radar",
+      "title": "Detect graph/report readiness before code changes",
+      "status": "wired_end_to_end",
+      "approvalRequired": false,
+      "localSteps": [
+        {
+          "app": "Hermes",
+          "action": "publish_graphify_report_status",
+          "mode": "read_only",
+          "output": "Hermes graphify-out/GRAPH_REPORT.md and graph.json status"
+        }
+      ],
+      "upstreamApps": [
+        "BrainCore",
+        "AiMailx",
+        "ControlX",
+        "BIH_Dashboard",
+        "Tony"
+      ],
+      "downstreamApps": [
+        "OpenClaw",
+        "AgentBroker",
+        "MyDataX",
+        "Notely",
+        "GTD",
+        "NovoBiz",
+        "FloatMic"
+      ]
+    },
+    {
+      "id": "auto-email-to-commitment-loop",
+      "ideaId": "email-to-commitment-loop",
+      "title": "Convert important email into approved commitments",
+      "status": "wired_end_to_end",
+      "approvalRequired": true,
+      "localSteps": [
+        {
+          "app": "Hermes",
+          "action": "notify_pending_commitment_risk",
+          "mode": "read_only",
+          "output": "recommendation notice"
+        }
+      ],
+      "upstreamApps": [
+        "AiMailx",
+        "BrainCore",
+        "Tony",
+        "AgentBroker",
+        "GTD"
+      ],
+      "downstreamApps": []
+    },
+    {
+      "id": "auto-bih-anomaly-remediation",
+      "ideaId": "bih-anomaly-remediation",
+      "title": "Remediate BIH anomalies through governed action",
+      "status": "wired_end_to_end",
+      "approvalRequired": true,
+      "localSteps": [
+        {
+          "app": "Hermes",
+          "action": "prepare_executive_notification",
+          "mode": "dry_run",
+          "output": "notification draft"
+        }
+      ],
+      "upstreamApps": [
+        "BIH_Dashboard",
+        "BrainCore",
+        "ControlX",
+        "AgentBroker"
+      ],
+      "downstreamApps": [
+        "Tony"
+      ]
+    },
+    {
+      "id": "auto-daily-executive-brief-rail",
+      "ideaId": "daily-executive-brief-rail",
+      "title": "Generate a ranked daily executive brief",
+      "status": "wired_end_to_end",
+      "approvalRequired": false,
+      "localSteps": [
+        {
+          "app": "Hermes",
+          "action": "compose_concise_brief",
+          "mode": "read_only",
+          "output": "daily brief"
+        }
+      ],
+      "upstreamApps": [],
+      "downstreamApps": [
+        "BrainCore",
+        "Tony",
+        "AiMailx",
+        "GTD",
+        "NovoBiz",
+        "ControlX",
+        "BIH_Dashboard"
+      ]
+    }
+  ]
+}

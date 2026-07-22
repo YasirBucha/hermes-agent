@@ -240,6 +240,30 @@ def test_create_live_transcripts_precreates_paths_and_manifest():
     assert "ctx B" in Path(paths[1]).read_text(encoding="utf-8")
 
 
+def test_stable_live_transcript_replay_preserves_log_and_manifest():
+    delegation_id = "deleg_stable_replay"
+    first_id, _writers, paths = create_live_transcripts(
+        [{"goal": "original goal"}], delegation_id=delegation_id
+    )
+    log_path = Path(paths[0])
+    log_path.write_text(
+        log_path.read_text(encoding="utf-8") + "sentinel completion\n",
+        encoding="utf-8",
+    )
+    manifest_path = live_transcript_root() / delegation_id / "manifest.json"
+    original_manifest = manifest_path.read_text(encoding="utf-8")
+
+    replay_id, _replay_writers, replay_paths = create_live_transcripts(
+        [{"goal": "conflicting replay"}], delegation_id=delegation_id
+    )
+
+    assert first_id == replay_id == delegation_id
+    assert replay_paths == paths
+    assert "sentinel completion" in log_path.read_text(encoding="utf-8")
+    assert "conflicting replay" not in log_path.read_text(encoding="utf-8")
+    assert manifest_path.read_text(encoding="utf-8") == original_manifest
+
+
 def test_update_manifest_statuses():
     tasks = [{"goal": "a"}, {"goal": "b"}]
     deleg_id, _writers, _paths = create_live_transcripts(tasks)

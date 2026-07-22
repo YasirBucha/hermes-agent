@@ -25,7 +25,7 @@ For the full feature reference, see [Subagent Delegation](/user-guide/features/d
 - Mechanical multi-step work with logic between steps → `execute_code`
 - Tasks needing user interaction → subagents can't use `clarify`
 - Quick file edits → do them directly
-- Durable long-running work that must survive session closure or process restart → `cronjob` or `terminal(background=True, notify_on_complete=True)`. Top-level delegation is asynchronous but still process-local.
+- Long-running execution that must resume after process restart → `cronjob` or `terminal(background=True, notify_on_complete=True)`. Top-level delegation persists its status, delivery, lease, and recovery receipt, but intentionally does not replay an interrupted child closure.
 
 ---
 
@@ -221,7 +221,7 @@ delegation:
 - **Separate terminals** — each subagent gets its own terminal session with separate working directory and state
 - **No conversation history** — subagents see only the `goal` and `context` the parent agent passes when calling `delegate_task`
 - **Default 50 iterations** — set `max_iterations` lower for simple tasks to save cost
-- **Not durable** — top-level delegation runs in the background and posts its result back later, but it remains tied to the owning session and Hermes process. Session closure, `/stop`, `/new`, or a process restart can cancel or strand in-progress work. Use `cronjob` or `terminal(background=True, notify_on_complete=True)` for work that must survive those boundaries.
+- **Durable state, non-replayed execution** — top-level delegation persists its handle, completion delivery, owner lease, bounded recovery state, and AgentBroker receipt. Session closure, `/stop`, or `/new` still cancels active children; a process restart records an in-flight outcome as `unknown` and sends an approval-gated recovery request to AgentBroker instead of replaying possible side effects. Use `cronjob` or `terminal(background=True, notify_on_complete=True)` when execution itself must resume automatically.
 
 ---
 

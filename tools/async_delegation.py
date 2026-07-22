@@ -36,14 +36,20 @@ logic stays in one place.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 from hermes_constants import get_hermes_home
 from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -79,6 +85,13 @@ _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
 _DB_LOCK = threading.Lock()
 
+_DEFAULT_LEASE_SECONDS = 90
+_LEASE_RENEW_INTERVAL_SECONDS = 30
+_DEFAULT_ESCALATION_MAX_ATTEMPTS = 3
+_ESCALATION_CLAIM_SECONDS = 30
+_AGENTBROKER_DEFAULT_URL = "http://127.0.0.1:8765"
+_AGENTBROKER_SCOPE = "/Users/yb/AI/HermesWork"
+
 
 def _db_path():
     return get_hermes_home() / "state.db"
@@ -108,7 +121,27 @@ def _connect() -> sqlite3.Connection:
             owner_started_at INTEGER,
             task_json TEXT,
             delivery_claim TEXT,
-            delivery_claimed_at REAL
+            delivery_claimed_at REAL,
+            idempotency_key TEXT,
+            request_fingerprint TEXT,
+            lease_expires_at REAL,
+            escalation_state TEXT NOT NULL DEFAULT 'not_required',
+            escalation_attempts INTEGER NOT NULL DEFAULT 0,
+            escalation_max_attempts INTEGER NOT NULL DEFAULT 3,
+            escalation_next_at REAL,
+            escalation_reason TEXT,
+            escalation_task_id TEXT,
+            escalation_error TEXT,
+            receipt_json TEXT
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS async_delegation_audit (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            delegation_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            data_json TEXT NOT NULL
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -118,42 +151,168 @@ def _connect() -> sqlite3.Connection:
         ("task_json", "TEXT"),
         ("delivery_claim", "TEXT"),
         ("delivery_claimed_at", "REAL"),
+        ("idempotency_key", "TEXT"),
+        ("request_fingerprint", "TEXT"),
+        ("lease_expires_at", "REAL"),
+        ("escalation_state", "TEXT NOT NULL DEFAULT 'not_required'"),
+        ("escalation_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("escalation_max_attempts", "INTEGER NOT NULL DEFAULT 3"),
+        ("escalation_next_at", "REAL"),
+        ("escalation_reason", "TEXT"),
+        ("escalation_task_id", "TEXT"),
+        ("escalation_error", "TEXT"),
+        ("receipt_json", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS ux_async_delegations_idempotency
+           ON async_delegations(idempotency_key)
+           WHERE idempotency_key IS NOT NULL"""
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_async_delegations_escalation
+           ON async_delegations(escalation_state, escalation_next_at)"""
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_async_delegation_audit_parent
+           ON async_delegation_audit(delegation_id, event_id)"""
+    )
     return conn
 
 
-def _persist_dispatch(record: Dict[str, Any]) -> None:
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _request_fingerprint(record: Dict[str, Any]) -> str:
+    immutable = {
+        key: record.get(key)
+        for key in (
+            "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
+            "session_key", "origin_ui_session_id", "parent_session_id",
+        )
+        if key in record
+    }
+    return hashlib.sha256(_canonical_json(immutable).encode("utf-8")).hexdigest()
+
+
+def _redact_audit_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _redact_audit_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_audit_value(item) for item in value]
+    if isinstance(value, str):
+        try:
+            from agent.redact import redact_sensitive_text
+
+            return redact_sensitive_text(
+                value[:4000], force=True, redact_url_credentials=True
+            )
+        except Exception:  # pragma: no cover - fail closed at the audit boundary
+            return "[redacted: redactor unavailable]"
+    return value
+
+
+def _insert_audit(
+    conn: sqlite3.Connection,
+    delegation_id: str,
+    event_type: str,
+    data: Optional[Dict[str, Any]] = None,
+    *,
+    created_at: Optional[float] = None,
+) -> None:
+    conn.execute(
+        """INSERT INTO async_delegation_audit
+           (delegation_id, event_type, created_at, data_json)
+           VALUES (?, ?, ?, ?)""",
+        (
+            delegation_id,
+            event_type,
+            time.time() if created_at is None else created_at,
+            _canonical_json(_redact_audit_value(data or {})),
+        ),
+    )
+
+
+def _persist_dispatch(record: Dict[str, Any]) -> Dict[str, Any]:
     now = time.time()
     try:
         from gateway.status import get_process_start_time
-        owner_started_at = get_process_start_time(__import__("os").getpid())
+        owner_started_at = get_process_start_time(os.getpid())
     except Exception:
         owner_started_at = None
+    idempotency_key = str(record.get("idempotency_key") or record["delegation_id"])
+    fingerprint = str(record.get("request_fingerprint") or _request_fingerprint(record))
+    lease_seconds = max(30, min(int(record.get("lease_seconds") or _DEFAULT_LEASE_SECONDS), 86400))
+    record["idempotency_key"] = idempotency_key
+    record["request_fingerprint"] = fingerprint
+    record["lease_seconds"] = lease_seconds
     task_payload = {
         key: record.get(key)
         for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch")
         if key in record
     }
     with _DB_LOCK, _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """SELECT delegation_id, request_fingerprint, state
+               FROM async_delegations
+               WHERE delegation_id=? OR idempotency_key=?""",
+            (record["delegation_id"], idempotency_key),
+        ).fetchall()
+        if rows:
+            existing = rows[0]
+            conflict = len(rows) > 1 or (existing[1] or "") != fingerprint
+            _insert_audit(
+                conn,
+                str(existing[0]),
+                "dispatch_conflict" if conflict else "duplicate_suppressed",
+                {"request_fingerprint": fingerprint},
+                created_at=now,
+            )
+            return {
+                "created": False,
+                "conflict": conflict,
+                "delegation_id": str(existing[0]),
+                "state": str(existing[2]),
+            }
         conn.execute(
-            """INSERT OR REPLACE INTO async_delegations
+            """INSERT INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?)""",
+                owner_started_at, task_json, idempotency_key,
+                request_fingerprint, lease_expires_at,
+                escalation_state, escalation_attempts, escalation_max_attempts)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?,
+                       ?, ?, ?, 'not_required', 0, ?)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
-             record["dispatched_at"], now, __import__("os").getpid(),
-             owner_started_at, json.dumps(task_payload)),
+             record["dispatched_at"], now, os.getpid(), owner_started_at,
+             _canonical_json(task_payload), idempotency_key, fingerprint,
+             now + lease_seconds,
+             int(record.get("escalation_max_attempts") or _DEFAULT_ESCALATION_MAX_ATTEMPTS)),
+        )
+        _insert_audit(
+            conn,
+            record["delegation_id"],
+            "dispatched",
+            {"request_fingerprint": fingerprint, "lease_seconds": lease_seconds},
+            created_at=now,
         )
     _prune_durable_records()
+    return {
+        "created": True,
+        "conflict": False,
+        "delegation_id": record["delegation_id"],
+        "state": "running",
+    }
 
 
 def _delete_durable_delegation(delegation_id: str) -> None:
     with _DB_LOCK, _connect() as conn:
+        conn.execute("DELETE FROM async_delegation_audit WHERE delegation_id=?", (delegation_id,))
         conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
 
 
@@ -194,6 +353,10 @@ def _prune_durable_records() -> None:
                    )""",
                 (overflow,),
             )
+        conn.execute(
+            """DELETE FROM async_delegation_audit
+               WHERE delegation_id NOT IN (SELECT delegation_id FROM async_delegations)"""
+        )
 
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
@@ -201,10 +364,21 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
     with _DB_LOCK, _connect() as conn:
         conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
+               event_json=?, result_json=?, delivery_state='pending',
+               lease_expires_at=NULL
                WHERE delegation_id=?""",
             (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]),
+             _canonical_json(event), _canonical_json(result), event["delegation_id"]),
+        )
+        _insert_audit(
+            conn,
+            str(event["delegation_id"]),
+            "completed",
+            {
+                "status": event.get("status", "completed"),
+                "error": event.get("error") or result.get("error"),
+            },
+            created_at=now,
         )
 
 
@@ -216,28 +390,400 @@ def _note_delivery_attempt(delegation_id: str) -> None:
         )
 
 
-def recover_abandoned_delegations() -> int:
+def _renew_lease(delegation_id: str, lease_seconds: int) -> bool:
+    now = time.time()
+    try:
+        with _DB_LOCK, _connect() as conn:
+            cur = conn.execute(
+                """UPDATE async_delegations
+                   SET lease_expires_at=?, updated_at=?
+                   WHERE delegation_id=? AND state IN ('running','finalizing')
+                     AND owner_pid=?""",
+                (now + lease_seconds, now, delegation_id, os.getpid()),
+            )
+            return cur.rowcount == 1
+    except Exception:
+        logger.debug("Async delegation %s lease renewal failed", delegation_id, exc_info=True)
+        return False
+
+
+def _run_with_lease(
+    delegation_id: str, lease_seconds: int, runner: Callable[[], Dict[str, Any]]
+) -> Dict[str, Any]:
+    stop = threading.Event()
+
+    def _heartbeat() -> None:
+        while not stop.wait(min(_LEASE_RENEW_INTERVAL_SECONDS, lease_seconds / 3)):
+            if not _renew_lease(delegation_id, lease_seconds):
+                return
+
+    heartbeat = threading.Thread(
+        target=_heartbeat,
+        name=f"async-lease-{delegation_id}",
+        daemon=True,
+    )
+    heartbeat.start()
+    try:
+        return runner() or {}
+    finally:
+        stop.set()
+
+
+class AgentBrokerUnavailable(RuntimeError):
+    """AgentBroker is not configured or cannot be reached safely."""
+
+
+def _agentbroker_token() -> str:
+    token = os.environ.get("BROKER_TOKEN", "").strip()
+    if 32 <= len(token) <= 4096 and not any(char.isspace() for char in token):
+        return token
+
+    token_file = os.environ.get("BROKER_TOKEN_FILE", "").strip()
+    if not token_file:
+        return ""
+    try:
+        path = Path(token_file).expanduser()
+        if not path.is_absolute():
+            raise ValueError("BROKER_TOKEN_FILE must be absolute")
+        path = path.resolve(strict=True)
+        metadata = path.stat()
+        if not path.is_file() or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+            raise ValueError("BROKER_TOKEN_FILE must be owner-only")
+        if metadata.st_size > 64 * 1024:
+            raise ValueError("BROKER_TOKEN_FILE is too large")
+        contents = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError, ValueError) as exc:
+        logger.warning("AgentBroker token file rejected: %s", exc)
+        return ""
+
+    candidate = contents.strip()
+    for line in contents.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "BROKER_TOKEN":
+            candidate = value.strip()
+            break
+    if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in {'"', "'"}:
+        candidate = candidate[1:-1]
+    return (
+        candidate
+        if 32 <= len(candidate) <= 4096
+        and not any(char.isspace() for char in candidate)
+        else ""
+    )
+
+
+def _agentbroker_base_url() -> str:
+    raw = os.environ.get("AGENTBROKER_URL", _AGENTBROKER_DEFAULT_URL).strip().rstrip("/")
+    parsed = urlsplit(raw)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username
+        or parsed.password
+    ):
+        raise AgentBrokerUnavailable("AgentBroker URL must be loopback HTTP")
+    return raw
+
+
+def _agentbroker_json(
+    method: str, path: str, payload: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    token = _agentbroker_token()
+    if not token:
+        raise AgentBrokerUnavailable("BROKER_TOKEN is not configured")
+    request = Request(
+        _agentbroker_base_url() + path,
+        data=_canonical_json(payload).encode("utf-8") if payload is not None else None,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method=method,
+    )
+    try:
+        with urlopen(request, timeout=5) as response:  # noqa: S310 - loopback-only URL above
+            raw = response.read(1024 * 1024)
+    except HTTPError as exc:
+        body = exc.read(4096).decode("utf-8", errors="replace")
+        safe = _redact_audit_value(body)
+        raise RuntimeError(f"AgentBroker HTTP {exc.code}: {safe}") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise AgentBrokerUnavailable(f"AgentBroker unavailable: {type(exc).__name__}") from exc
+    data = json.loads(raw.decode("utf-8")) if raw else {}
+    if not isinstance(data, dict):
+        raise RuntimeError("AgentBroker returned a non-object response")
+    return data
+
+
+def _submit_agentbroker_task(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _agentbroker_json("POST", "/tasks", payload)
+
+
+def _build_escalation_task(row: Dict[str, Any]) -> Dict[str, Any]:
+    source_key = str(row.get("idempotency_key") or row["delegation_id"])
+    digest = hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:32]
+    return {
+        "task_id": f"hermes_escalation_{digest}",
+        "idempotency_key": f"hermes_escalation_{digest}",
+        "correlation_id": str(row["delegation_id"]),
+        "requesting_agent": "hermes-manager",
+        "target_agent": "qa-agent",
+        "task_type": "code_qa",
+        "allowed_scope": _AGENTBROKER_SCOPE,
+        "permission_level": "read_only",
+        "timeout_seconds": 300,
+        "human_approval_required": True,
+        "max_attempts": _DEFAULT_ESCALATION_MAX_ATTEMPTS,
+        "payload": {
+            "kind": "hermes_delegation_recovery",
+            "delegation_id": str(row["delegation_id"]),
+            "request_fingerprint": str(row.get("request_fingerprint") or ""),
+            "failure_state": str(row.get("state") or "unknown"),
+            "reason": str(row.get("escalation_reason") or "Delegation outcome unknown"),
+            "requested_action": (
+                "Review the failed delegated session and return a safe recovery "
+                "recommendation. Do not execute consequential actions."
+            ),
+        },
+    }
+
+
+def _queue_escalation(delegation_id: str, reason: str) -> bool:
+    now = time.time()
+    safe_reason = str(_redact_audit_value(reason))[:2000]
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations
+               SET escalation_state='pending', escalation_next_at=?,
+                   escalation_reason=?, escalation_error=NULL, updated_at=?
+               WHERE delegation_id=? AND escalation_state='not_required'""",
+            (now, safe_reason, now, delegation_id),
+        )
+        if cur.rowcount:
+            _insert_audit(
+                conn,
+                delegation_id,
+                "escalation_queued",
+                {"reason": safe_reason},
+                created_at=now,
+            )
+        return cur.rowcount == 1
+
+
+def _schedule_escalation_retry(delegation_id: str, delay_seconds: int) -> None:
+    timer = threading.Timer(
+        delay_seconds,
+        lambda: process_pending_escalations(delegation_id=delegation_id),
+    )
+    timer.name = f"async-escalation-{delegation_id}"
+    timer.daemon = True
+    timer.start()
+
+
+def process_pending_escalations(
+    *,
+    submitter: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+    now: Optional[float] = None,
+    limit: int = 20,
+    delegation_id: Optional[str] = None,
+) -> int:
+    """Submit due recovery requests to AgentBroker with a durable retry bound."""
+    using_default_submitter = submitter is None
+    if submitter is None:
+        if not _agentbroker_token():
+            return 0
+        submitter = _submit_agentbroker_task
+    clock = time.time() if now is None else float(now)
+    processed = 0
+    for _ in range(max(0, min(int(limit), 100))):
+        with _DB_LOCK, _connect() as conn:
+            conn.execute(
+                """UPDATE async_delegations
+                   SET escalation_state=CASE
+                         WHEN escalation_attempts >= escalation_max_attempts
+                         THEN 'exhausted' ELSE 'pending' END,
+                       updated_at=?
+                   WHERE escalation_state='submitting'
+                     AND escalation_next_at IS NOT NULL
+                     AND escalation_next_at <= ?""",
+                (clock, clock),
+            )
+            params: List[Any] = [clock]
+            selector = ""
+            if delegation_id:
+                selector = " AND delegation_id=?"
+                params.append(delegation_id)
+            row = conn.execute(
+                """SELECT delegation_id, idempotency_key, request_fingerprint,
+                          state, escalation_attempts, escalation_max_attempts,
+                          escalation_reason
+                   FROM async_delegations
+                   WHERE escalation_state='pending'
+                     AND escalation_attempts < escalation_max_attempts
+                     AND COALESCE(escalation_next_at, 0) <= ?"""
+                + selector
+                + " ORDER BY updated_at, delegation_id LIMIT 1",
+                tuple(params),
+            ).fetchone()
+            if row is None:
+                break
+            item = {
+                "delegation_id": row[0],
+                "idempotency_key": row[1],
+                "request_fingerprint": row[2],
+                "state": row[3],
+                "escalation_attempts": int(row[4] or 0),
+                "escalation_max_attempts": int(
+                    row[5] or _DEFAULT_ESCALATION_MAX_ATTEMPTS
+                ),
+                "escalation_reason": row[6],
+            }
+            attempt = item["escalation_attempts"] + 1
+            claimed = conn.execute(
+                """UPDATE async_delegations
+                   SET escalation_state='submitting', escalation_attempts=?,
+                       escalation_next_at=?, updated_at=?
+                   WHERE delegation_id=? AND escalation_state='pending'
+                     AND escalation_attempts=?""",
+                (
+                    attempt,
+                    clock + _ESCALATION_CLAIM_SECONDS,
+                    clock,
+                    item["delegation_id"],
+                    item["escalation_attempts"],
+                ),
+            )
+            if claimed.rowcount != 1:
+                continue
+            _insert_audit(
+                conn,
+                item["delegation_id"],
+                "escalation_attempted",
+                {"attempt": attempt, "max_attempts": item["escalation_max_attempts"]},
+                created_at=clock,
+            )
+
+        processed += 1
+        try:
+            response = submitter(_build_escalation_task(item))
+            if not isinstance(response, dict) or not response.get("task_id"):
+                raise RuntimeError("AgentBroker response missing task_id")
+            safe_response = _redact_audit_value(response)
+            task_id = str(response["task_id"])
+            with _DB_LOCK, _connect() as conn:
+                conn.execute(
+                    """UPDATE async_delegations
+                       SET escalation_state='submitted', escalation_task_id=?,
+                           escalation_next_at=NULL, escalation_error=NULL,
+                           receipt_json=?, updated_at=?
+                       WHERE delegation_id=?""",
+                    (
+                        task_id,
+                        _canonical_json({"submission": safe_response, "updated_at": clock}),
+                        clock,
+                        item["delegation_id"],
+                    ),
+                )
+                _insert_audit(
+                    conn,
+                    item["delegation_id"],
+                    "escalation_submitted",
+                    {"task_id": task_id, "status": response.get("status")},
+                    created_at=clock,
+                )
+        except Exception as exc:  # noqa: BLE001 - durable retry boundary
+            safe_error = str(_redact_audit_value(f"{type(exc).__name__}: {exc}"))[:2000]
+            exhausted = attempt >= item["escalation_max_attempts"]
+            backoff = min(2 ** max(0, attempt - 1), 60)
+            with _DB_LOCK, _connect() as conn:
+                conn.execute(
+                    """UPDATE async_delegations
+                       SET escalation_state=?, escalation_next_at=?,
+                           escalation_error=?, updated_at=?
+                       WHERE delegation_id=?""",
+                    (
+                        "exhausted" if exhausted else "pending",
+                        None if exhausted else clock + backoff,
+                        safe_error,
+                        clock,
+                        item["delegation_id"],
+                    ),
+                )
+                _insert_audit(
+                    conn,
+                    item["delegation_id"],
+                    "escalation_exhausted" if exhausted else "escalation_failed",
+                    {"attempt": attempt, "error": safe_error},
+                    created_at=clock,
+                )
+            if not exhausted and using_default_submitter:
+                _schedule_escalation_retry(item["delegation_id"], backoff)
+    return processed
+
+
+def _failure_reason(status: str, result: Dict[str, Any]) -> Optional[str]:
+    if status not in {"error", "failed", "failure", "timeout", "unknown"}:
+        return None
+    errors = [str(result.get("error") or "").strip()]
+    for child in result.get("results") or []:
+        if isinstance(child, dict) and child.get("status") not in {"completed", "success"}:
+            errors.append(str(child.get("error") or child.get("exit_reason") or "").strip())
+    detail = "; ".join(value for value in errors if value)[:2000]
+    return f"Delegation ended with status {status}" + (f": {detail}" if detail else "")
+
+
+def _attach_escalation_to_event(event: Dict[str, Any]) -> None:
+    delegation_id = str(event.get("delegation_id") or "")
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            """SELECT escalation_state, escalation_attempts,
+                      escalation_max_attempts, escalation_task_id,
+                      escalation_error
+               FROM async_delegations WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+        if row is None:
+            return
+        event["escalation"] = {
+            "state": row[0],
+            "attempts": int(row[1] or 0),
+            "max_attempts": int(row[2] or _DEFAULT_ESCALATION_MAX_ATTEMPTS),
+            "task_id": row[3],
+            "error": row[4],
+        }
+        conn.execute(
+            "UPDATE async_delegations SET event_json=? WHERE delegation_id=?",
+            (_canonical_json(event), delegation_id),
+        )
+
+
+def recover_abandoned_delegations(
+    *,
+    escalation_submitter: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+) -> int:
     """Classify records whose owning process disappeared as outcome unknown."""
     try:
         from gateway.status import _pid_exists, get_process_start_time
     except Exception:
         return 0
     now = time.time()
-    recovered = 0
+    recovered_events: List[Dict[str, Any]] = []
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
-                      owner_started_at, task_json
+                      owner_started_at, task_json, lease_expires_at
                FROM async_delegations WHERE state IN ('running','finalizing')"""
         ).fetchall()
         for row in rows:
-            delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json = row
+            (
+                delegation_id, session_key, origin_ui, parent_id, dispatched_at,
+                pid, started, task_json, lease_expires_at,
+            ) = row
             live = False
             if pid:
                 live = _pid_exists(int(pid))
                 if live and started is not None:
                     live = get_process_start_time(int(pid)) == int(started)
+                if live and lease_expires_at is not None:
+                    live = float(lease_expires_at) > now
             if live:
                 continue
             task = json.loads(task_json or "{}")
@@ -249,18 +795,35 @@ def recover_abandoned_delegations() -> int:
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
                 "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
                 "status": "unknown", "summary": None,
-                "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
+                "error": (
+                    "Delegation owner lease expired before recording a terminal "
+                    "result; outcome unknown."
+                ),
                 "dispatched_at": dispatched_at, "completed_at": now,
             }
             result = {"status": "unknown", "summary": None, "error": event["error"]}
             conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
-                   updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                   updated_at=?, event_json=?, result_json=?, delivery_state='pending',
+                   lease_expires_at=NULL
                    WHERE delegation_id=?""",
-                (now, now, json.dumps(event), json.dumps(result), delegation_id),
+                (now, now, _canonical_json(event), _canonical_json(result), delegation_id),
             )
-            recovered += 1
-    return recovered
+            _insert_audit(
+                conn,
+                delegation_id,
+                "abandoned_recovered",
+                {"status": "unknown", "reason": event["error"]},
+                created_at=now,
+            )
+            recovered_events.append(event)
+    for event in recovered_events:
+        _queue_escalation(str(event["delegation_id"]), str(event["error"]))
+    if recovered_events:
+        process_pending_escalations(submitter=escalation_submitter)
+        for event in recovered_events:
+            _attach_escalation_to_event(event)
+    return len(recovered_events)
 
 
 def restore_undelivered_completions(target_queue) -> int:
@@ -276,16 +839,32 @@ def restore_undelivered_completions(target_queue) -> int:
     results seconds after boot (#64484).
     """
     recover_abandoned_delegations()
+    process_pending_escalations()
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
-            """SELECT delegation_id, event_json FROM async_delegations
+            """SELECT delegation_id, event_json, escalation_state,
+                      escalation_attempts, escalation_max_attempts,
+                      escalation_task_id, escalation_error
+               FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-        for _delegation_id, payload in rows:
+        for (
+            _delegation_id, payload, escalation_state, escalation_attempts,
+            escalation_max_attempts, escalation_task_id, escalation_error,
+        ) in rows:
             evt = json.loads(payload)
             if isinstance(evt, dict):
                 evt["restored"] = True
+                evt["escalation"] = {
+                    "state": escalation_state,
+                    "attempts": int(escalation_attempts or 0),
+                    "max_attempts": int(
+                        escalation_max_attempts or _DEFAULT_ESCALATION_MAX_ATTEMPTS
+                    ),
+                    "task_id": escalation_task_id,
+                    "error": escalation_error,
+                }
             target_queue.put(evt)
     return len(rows)
 
@@ -375,7 +954,12 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
     with _DB_LOCK, _connect() as conn:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
-                      result_json, delivery_state, delivery_attempts
+                      result_json, delivery_state, delivery_attempts,
+                      idempotency_key, request_fingerprint, lease_expires_at,
+                      escalation_state, escalation_attempts,
+                      escalation_max_attempts, escalation_next_at,
+                      escalation_reason, escalation_task_id, escalation_error,
+                      receipt_json
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
         ).fetchone()
     if row is None:
@@ -385,7 +969,96 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "dispatched_at": row[2], "completed_at": row[3],
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
+        "idempotency_key": row[7], "request_fingerprint": row[8],
+        "lease_expires_at": row[9],
+        "escalation": {
+            "state": row[10], "attempts": int(row[11] or 0),
+            "max_attempts": int(row[12] or _DEFAULT_ESCALATION_MAX_ATTEMPTS),
+            "next_at": row[13], "reason": row[14], "task_id": row[15],
+            "error": row[16],
+        },
+        "receipt": json.loads(row[17]) if row[17] else None,
     }
+
+
+def get_delegation_audit(delegation_id: str, *, limit: int = 100) -> List[Dict[str, Any]]:
+    bounded = max(1, min(int(limit), 500))
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            """SELECT event_id, event_type, created_at, data_json
+               FROM async_delegation_audit WHERE delegation_id=?
+               ORDER BY event_id DESC LIMIT ?""",
+            (delegation_id, bounded),
+        ).fetchall()
+    return [
+        {
+            "event_id": row[0],
+            "event_type": row[1],
+            "created_at": row[2],
+            "data": json.loads(row[3]) if row[3] else {},
+        }
+        for row in reversed(rows)
+    ]
+
+
+def refresh_delegation_receipt(
+    delegation_id: str,
+    *,
+    fetcher: Optional[Callable[[str], Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    current = get_durable_delegation(delegation_id)
+    if current is None:
+        return None
+    task_id = str(current["escalation"].get("task_id") or "")
+    if not task_id:
+        return current.get("receipt")
+    if fetcher is None:
+        if not _agentbroker_token():
+            return current.get("receipt")
+        fetcher = lambda path: _agentbroker_json("GET", path)
+    task = fetcher(f"/tasks/{task_id}")
+    receipt = None
+    try:
+        receipt = fetcher(f"/tasks/{task_id}/receipt")
+    except Exception as exc:  # receipt is absent until the broker task is terminal
+        if "404" not in str(exc):
+            raise
+    updated_at = time.time()
+    snapshot = _redact_audit_value(
+        {"task": task, "receipt": receipt, "updated_at": updated_at}
+    )
+    with _DB_LOCK, _connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET receipt_json=?, updated_at=? WHERE delegation_id=?",
+            (_canonical_json(snapshot), updated_at, delegation_id),
+        )
+        _insert_audit(
+            conn,
+            delegation_id,
+            "receipt_refreshed",
+            {"task_id": task_id, "status": task.get("status")},
+            created_at=updated_at,
+        )
+    return snapshot
+
+
+def get_delegation_receipt(
+    delegation_id: str,
+    *,
+    refresh: bool = False,
+    fetcher: Optional[Callable[[str], Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    if refresh:
+        return refresh_delegation_receipt(delegation_id, fetcher=fetcher)
+    current = get_durable_delegation(delegation_id)
+    return None if current is None else current.get("receipt")
+
+
+def get_delegation_status(delegation_id: str) -> Optional[Dict[str, Any]]:
+    current = get_durable_delegation(delegation_id)
+    if current is not None:
+        current["audit"] = get_delegation_audit(delegation_id)
+    return current
 
 
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
@@ -415,6 +1088,11 @@ def active_count() -> int:
 
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
+
+
+def _delegation_id_for_key(idempotency_key: str) -> str:
+    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:16]
+    return f"deleg_{digest}"
 
 
 def _prune_completed_locked() -> None:
@@ -448,6 +1126,10 @@ def dispatch_async_delegation(
     origin_ui_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    delegation_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    lease_seconds: int = _DEFAULT_LEASE_SECONDS,
+    escalation_max_attempts: int = _DEFAULT_ESCALATION_MAX_ATTEMPTS,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -483,7 +1165,8 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
-    delegation_id = _new_delegation_id()
+    idempotency_key = str(idempotency_key or delegation_id or _new_delegation_id())
+    delegation_id = delegation_id or _delegation_id_for_key(idempotency_key)
     dispatched_at = time.time()
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
@@ -499,15 +1182,36 @@ def dispatch_async_delegation(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "idempotency_key": idempotency_key,
+        "lease_seconds": lease_seconds,
+        "escalation_max_attempts": max(
+            1, min(int(escalation_max_attempts), 10)
+        ),
     }
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
     # from different gateway sessions) both pass the check and exceed the cap.
     with _records_lock:
+        persisted = _persist_dispatch(record)
+        if not persisted["created"]:
+            if persisted["conflict"]:
+                return {
+                    "status": "rejected",
+                    "reason": "idempotency_conflict",
+                    "error": "Async delegation idempotency key conflicts with different task content.",
+                    "delegation_id": persisted["delegation_id"],
+                }
+            return {
+                "status": "dispatched",
+                "delegation_id": persisted["delegation_id"],
+                "state": persisted["state"],
+                "idempotent_replay": True,
+            }
         running = sum(
             1 for r in _records.values() if r.get("status") == "running"
         )
         if running >= max_async_children:
+            _delete_durable_delegation(delegation_id)
             return {
                 "status": "rejected",
                 "error": (
@@ -520,14 +1224,13 @@ def dispatch_async_delegation(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
         result: Dict[str, Any] = {}
         status = "error"
         try:
-            result = runner() or {}
+            result = _run_with_lease(delegation_id, record["lease_seconds"], runner)
             status = result.get("status") or "completed"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception("Async delegation %s crashed", delegation_id)
@@ -632,6 +1335,11 @@ def _push_completion_event(
         "exit_reason": result.get("exit_reason"),
     }
     _persist_completion(evt, result)
+    reason = _failure_reason(status, result)
+    if reason:
+        _queue_escalation(str(record.get("delegation_id") or ""), reason)
+        process_pending_escalations(delegation_id=str(record.get("delegation_id") or ""))
+    _attach_escalation_to_event(evt)
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -656,6 +1364,9 @@ def dispatch_async_delegation_batch(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    lease_seconds: int = _DEFAULT_LEASE_SECONDS,
+    escalation_max_attempts: int = _DEFAULT_ESCALATION_MAX_ATTEMPTS,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -677,7 +1388,8 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
-    delegation_id = delegation_id or _new_delegation_id()
+    idempotency_key = str(idempotency_key or delegation_id or _new_delegation_id())
+    delegation_id = delegation_id or _delegation_id_for_key(idempotency_key)
     dispatched_at = time.time()
     n = len(goals)
     # A combined goal label for status listings / the completion header.
@@ -700,12 +1412,33 @@ def dispatch_async_delegation_batch(
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
         "is_batch": True,
+        "idempotency_key": idempotency_key,
+        "lease_seconds": lease_seconds,
+        "escalation_max_attempts": max(
+            1, min(int(escalation_max_attempts), 10)
+        ),
     }
     with _records_lock:
+        persisted = _persist_dispatch(record)
+        if not persisted["created"]:
+            if persisted["conflict"]:
+                return {
+                    "status": "rejected",
+                    "reason": "idempotency_conflict",
+                    "error": "Async delegation idempotency key conflicts with different task content.",
+                    "delegation_id": persisted["delegation_id"],
+                }
+            return {
+                "status": "dispatched",
+                "delegation_id": persisted["delegation_id"],
+                "state": persisted["state"],
+                "idempotent_replay": True,
+            }
         running = sum(
             1 for r in _records.values() if r.get("status") == "running"
         )
         if running >= max_async_children:
+            _delete_durable_delegation(delegation_id)
             return {
                 "status": "rejected",
                 "error": (
@@ -717,17 +1450,19 @@ def dispatch_async_delegation_batch(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
         combined: Dict[str, Any] = {}
         status = "error"
         try:
-            combined = runner() or {}
+            combined = _run_with_lease(delegation_id, record["lease_seconds"], runner)
             # Batch status: completed unless every child errored/was interrupted.
             child_results = combined.get("results") or []
-            if child_results and all(
+            child_statuses = [str(r.get("status") or "") for r in child_results]
+            if child_statuses and all(value == "timeout" for value in child_statuses):
+                status = "timeout"
+            elif child_results and all(
                 (r.get("status") not in ("completed", "success"))
                 for r in child_results
             ):
@@ -816,6 +1551,11 @@ def _finalize_batch(
         "completed_at": completed_at,
     }
     _persist_completion(evt, combined)
+    reason = _failure_reason(status, combined)
+    if reason:
+        _queue_escalation(delegation_id, reason)
+        process_pending_escalations(delegation_id=delegation_id)
+    _attach_escalation_to_event(evt)
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
