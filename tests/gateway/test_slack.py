@@ -2912,6 +2912,15 @@ class TestEditMessage:
         kwargs = adapter._app.client.chat_update.call_args.kwargs
         assert kwargs["text"] == "AT&amp;T &lt; 5 &gt; 3"
 
+    @pytest.mark.asyncio
+    async def test_edit_message_truncates_oversized_content(self, adapter):
+        """Oversized edits are truncated instead of failing with msg_too_long."""
+        adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
+        result = await adapter.edit_message("C123", "1234.5678", "x" * 45000)
+        assert result.success
+        kwargs = adapter._app.client.chat_update.call_args.kwargs
+        assert len(kwargs["text"]) <= adapter.MAX_MESSAGE_LENGTH
+
 
 # ---------------------------------------------------------------------------
 # TestEditMessageStreamingPipeline
@@ -4071,6 +4080,69 @@ class TestMessageSplitting:
         assert "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>" in kwargs["text"]
 
 
+class TestEmptyTextGuard:
+    """Guard against Slack ``no_text`` errors when content is empty/whitespace."""
+
+    @pytest.mark.asyncio
+    async def test_send_skips_empty_string(self, adapter):
+        """Empty content must not call chat_postMessage."""
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+        result = await adapter.send("C123", "")
+        assert result.success is True
+        adapter._app.client.chat_postMessage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_skips_whitespace_only(self, adapter):
+        """Whitespace-only content must not call chat_postMessage."""
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+        result = await adapter.send("C123", "   \n\t  ")
+        assert result.success is True
+        adapter._app.client.chat_postMessage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_skips_empty(self, monkeypatch):
+        """_standalone_send returns success without HTTP call on empty text."""
+        from plugins.platforms.slack.adapter import _standalone_send
+        from types import SimpleNamespace
+
+        pconfig = SimpleNamespace(token="xoxb-test", extra={})
+
+        # Patch aiohttp so the import succeeds, but it should never be used.
+        mock_session = MagicMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(
+            "plugins.platforms.slack.adapter.aiohttp",
+            MagicMock(ClientSession=MagicMock(return_value=mock_session)),
+        )
+
+        result = await _standalone_send(pconfig, "C123", "")
+        assert result.get("success") is True
+        assert result.get("skipped") == "empty_text"
+        mock_session.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_skips_whitespace(self, monkeypatch):
+        """_standalone_send returns success without HTTP call on whitespace."""
+        from plugins.platforms.slack.adapter import _standalone_send
+        from types import SimpleNamespace
+
+        pconfig = SimpleNamespace(token="xoxb-test", extra={})
+
+        mock_session = MagicMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(
+            "plugins.platforms.slack.adapter.aiohttp",
+            MagicMock(ClientSession=MagicMock(return_value=mock_session)),
+        )
+
+        result = await _standalone_send(pconfig, "C123", "   \n  ")
+        assert result.get("success") is True
+        assert result.get("skipped") == "empty_text"
+        mock_session.post.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # TestReplyBroadcast
 # ---------------------------------------------------------------------------
@@ -4995,3 +5067,114 @@ class TestThreadContextUnverifiedTagging:
         # Renders successfully without trust tag (exception → unknown trust).
         assert "U_X: hello" in content
         assert "[unverified]" not in content
+
+
+# ---------------------------------------------------------------------------
+# TestThreadContextAppMessages
+# ---------------------------------------------------------------------------
+
+
+class TestThreadContextAppMessages:
+    """App-posted messages (Alertmanager, Grafana, CI bots) frequently carry
+    their content in ``attachments``/``blocks`` with an empty top-level
+    ``text``. Thread-context must fall back to those so, e.g., an alert that
+    started the thread the bot was asked to investigate is not dropped."""
+
+    @staticmethod
+    def _make_replies(messages):
+        return AsyncMock(return_value={"messages": messages})
+
+    @pytest.mark.asyncio
+    async def test_attachment_only_parent_is_included(self, adapter):
+        """Alertmanager-style parent: empty text, content in a legacy attachment."""
+        adapter._thread_context_cache.clear()
+        messages = [
+            {  # parent posted by the Alertmanager app: text="" , content in attachment
+                "ts": "100.0",
+                "bot_id": "B_ALERTMGR",
+                "subtype": "bot_message",
+                "username": "Alertmanager",
+                "text": "",
+                "attachments": [
+                    {
+                        "fallback": "[FIRING:1] KubeJobFailed cluster-01 "
+                        "batch-job-123456",
+                        "color": "danger",
+                    }
+                ],
+            },
+            {"ts": "101.0", "user": "U_BOB", "text": "<@U_BOT> investigate"},
+        ]
+        adapter._app.client.conversations_replies = self._make_replies(messages)
+
+        with patch.object(
+            adapter, "_resolve_user_name",
+            new=AsyncMock(side_effect=lambda uid, **_: uid),
+        ):
+            content = await adapter._fetch_thread_context(
+                channel_id="C1", thread_ts="100.0", current_ts="999.0",
+            )
+
+        # The alert text (previously dropped) is now present in the context.
+        assert "KubeJobFailed" in content
+        assert "batch-job-123456" in content
+        assert "[thread parent]" in content
+
+    @pytest.mark.asyncio
+    async def test_blocks_only_message_is_included(self, adapter):
+        """Block Kit message with empty text falls back to block text."""
+        adapter._thread_context_cache.clear()
+        messages = [
+            {"ts": "100.0", "user": "U_BOB", "text": "kickoff"},
+            {
+                "ts": "101.0",
+                "bot_id": "B_CI",
+                "subtype": "bot_message",
+                "username": "CI",
+                "text": "",
+                "blocks": [
+                    {
+                        "type": "rich_text",
+                        "elements": [
+                            {
+                                "type": "rich_text_section",
+                                "elements": [
+                                    {"type": "text", "text": "deploy #42 succeeded"}
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            },
+        ]
+        adapter._app.client.conversations_replies = self._make_replies(messages)
+
+        with patch.object(
+            adapter, "_resolve_user_name",
+            new=AsyncMock(side_effect=lambda uid, **_: uid),
+        ):
+            content = await adapter._fetch_thread_context(
+                channel_id="C1", thread_ts="100.0", current_ts="999.0",
+            )
+
+        assert "deploy #42 succeeded" in content
+
+    @pytest.mark.asyncio
+    async def test_message_without_any_text_is_skipped(self, adapter):
+        """A message with no text/blocks/attachments is still skipped (no crash)."""
+        adapter._thread_context_cache.clear()
+        messages = [
+            {"ts": "100.0", "user": "U_BOB", "text": "hello"},
+            {"ts": "101.0", "bot_id": "B_X", "subtype": "bot_message", "text": ""},
+        ]
+        adapter._app.client.conversations_replies = self._make_replies(messages)
+
+        with patch.object(
+            adapter, "_resolve_user_name",
+            new=AsyncMock(side_effect=lambda uid, **_: uid),
+        ):
+            content = await adapter._fetch_thread_context(
+                channel_id="C1", thread_ts="100.0", current_ts="999.0",
+            )
+
+        assert "hello" in content  # the real message survives; empty bot msg dropped

@@ -56,9 +56,9 @@ from gateway.platforms.base import (
 )
 
 try:  # sibling module; support both package and flat plugin-dir import
-    from .block_kit import render_blocks
+    from .block_kit import render_blocks, sanitize_blocks
 except ImportError:  # pragma: no cover - plugin loaded outside package context
-    from block_kit import render_blocks  # type: ignore
+    from block_kit import render_blocks, sanitize_blocks  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -111,6 +111,63 @@ def check_slack_requirements() -> bool:
     from tools.lazy_deps import ensure_and_bind
 
     return ensure_and_bind("platform.slack", _import, globals(), prompt=False)
+
+
+def _collect_slack_block_mentions(blocks: list) -> list:
+    """Return ``<@UID>`` mention tokens authored in non-quoted Block Kit text.
+
+    Slack's flat top-level ``text`` field does NOT contain mentions that were
+    authored only inside Block Kit ``blocks`` (e.g. a ``rich_text_section`` with
+    a ``user`` element).  This walker recovers those mentions so the gates can
+    see Block-Kit-only mentions instead of silently dropping them (#52387).
+
+    Mentions nested inside ``rich_text_quote`` (quoted/forwarded content) are
+    deliberately ignored, so quoted text cannot trick the bot into responding
+    (matches the existing channel-routing contract).
+    """
+    mentions: list = []
+
+    def _walk(node, in_quote: bool) -> None:
+        if isinstance(node, list):
+            for item in node:
+                _walk(item, in_quote)
+            return
+        if not isinstance(node, dict):
+            return
+        node_type = node.get("type")
+        quoted = in_quote or node_type == "rich_text_quote"
+        if node_type == "user" and not quoted:
+            uid = node.get("user_id", "")
+            if uid:
+                mentions.append(f"<@{uid}>")
+        for key in ("elements", "element"):
+            child = node.get(key)
+            if child is not None:
+                _walk(child, quoted)
+
+    try:
+        _walk(blocks, False)
+    except Exception:  # pragma: no cover - defensive, never break gating
+        return []
+    return mentions
+
+
+def _slack_mention_detection_text(event: dict) -> str:
+    """Return the text used for @mention detection on a Slack message event.
+
+    Combines the flat top-level ``text`` with any ``<@UID>`` mentions recovered
+    from non-quoted Block Kit blocks (#52387), so a genuine Block-Kit-only
+    mention reaches the gates while quoted/forwarded mentions stay ignored.
+    """
+    flat = event.get("text", "") or ""
+    blocks = event.get("blocks")
+    if not blocks:
+        return flat
+    mentions = _collect_slack_block_mentions(blocks)
+    extra = [m for m in mentions if m not in flat]
+    if not extra:
+        return flat
+    return (flat.strip() + "\n" + " ".join(extra)).strip()
 
 
 def _extract_text_from_slack_blocks(blocks: list) -> str:
@@ -208,6 +265,47 @@ def _extract_text_from_slack_blocks(blocks: list) -> str:
     return "\n".join(parts)
 
 
+def _extract_text_from_slack_attachments(attachments: list) -> str:
+    """Extract readable text from legacy Slack message ``attachments``.
+
+    Apps such as Alertmanager, Grafana, PagerDuty, and CI bots post messages
+    with an empty top-level ``text`` and the real content inside ``attachments``
+    (Slack's legacy secondary-content format) or nested Block Kit ``blocks``.
+    Without this, such messages are invisible when the agent reads thread
+    history — e.g. an alert that started the very thread the agent was asked to
+    investigate would come through blank.
+
+    Prefers structured fields (``pretext``/``title``/``text``/``fields``) and
+    only falls back to an attachment's ``fallback`` string when it carries
+    nothing else.
+    """
+    if not attachments:
+        return ""
+
+    lines: list[str] = []
+    for att in attachments:
+        if not isinstance(att, dict):
+            continue
+        got: list[str] = [
+            str(att[key]) for key in ("pretext", "title", "text") if att.get(key)
+        ]
+        for field in att.get("fields", []) or []:
+            if not isinstance(field, dict):
+                continue
+            got += [str(field[k]) for k in ("title", "value") if field.get(k)]
+        nested = att.get("blocks")
+        if nested:
+            block_text = _extract_text_from_slack_blocks(nested)
+            if block_text:
+                got.append(block_text)
+        # Only use the (often duplicative) fallback when nothing structured exists.
+        if not got and att.get("fallback"):
+            got.append(str(att["fallback"]))
+        lines += got
+
+    return "\n".join(line for line in lines if line).strip()
+
+
 def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> str:
     """Return a compact, redacted JSON view of the current message's Block Kit payload."""
     if not blocks:
@@ -273,6 +371,47 @@ def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> st
         payload = payload[: max_chars - 18].rstrip() + "\n... [truncated]"
 
     return f"[Slack Block Kit payload for this message]\n```json\n{payload}\n```"
+
+
+def _extract_urls_from_slack_blocks(blocks: list) -> list[str]:
+    """Walk a Block Kit ``blocks`` tree and return URLs found on any element.
+
+    Returns URLs preserving discovery order with duplicates removed. Used to
+    surface the actionable links (``View graph``, ``View incident``, etc.)
+    embedded in bot-posted alerts so an agent reading the thread can fetch
+    or click them. The companion serializer
+    :func:`_serialize_slack_blocks_for_agent` deliberately strips ``url`` to
+    keep the JSON view compact and to avoid exposing arbitrary URLs through
+    the generic payload dump; this helper is the targeted opt-in for
+    use sites where URLs are the whole point of the message.
+    """
+    if not blocks:
+        return []
+
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _maybe_add(value: Any) -> None:
+        if isinstance(value, str) and value.startswith(("http://", "https://")):
+            if value not in seen:
+                seen.add(value)
+                found.append(value)
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            # The common URL-bearing keys across Block Kit (buttons, link
+            # elements in rich_text, image accessories, etc.).
+            for key in ("url", "image_url", "external_url"):
+                if key in node:
+                    _maybe_add(node[key])
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(blocks)
+    return found
 
 
 def _apply_slack_proxy(client: Any, proxy_url: Optional[str]) -> None:
@@ -1427,6 +1566,11 @@ class SlackAdapter(BasePlatformAdapter):
             # Convert standard markdown → Slack mrkdwn
             formatted = self.format_message(content)
 
+            # Guard against empty/whitespace-only messages — Slack API
+            # returns ``no_text`` for chat.postMessage with blank text.
+            if not formatted or not formatted.strip():
+                return SendResult(success=True)
+
             # Split long messages, preserving code block boundaries
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
@@ -1458,9 +1602,23 @@ class SlackAdapter(BasePlatformAdapter):
                     if broadcast and i == 0:
                         kwargs["reply_broadcast"] = True
 
-                last_result = await self._get_client(
-                    chat_id, team_id=self._metadata_team_id(metadata)
-                ).chat_postMessage(**kwargs)
+                try:
+                    last_result = await self._get_client(
+                        chat_id, team_id=self._metadata_team_id(metadata)
+                    ).chat_postMessage(**kwargs)
+                except Exception as e:
+                    if kwargs.get("blocks") and self._is_block_payload_rejection(e):
+                        retry_kwargs = dict(kwargs)
+                        retry_kwargs.pop("blocks", None)
+                        logger.info(
+                            "[Slack] Block Kit payload rejected; retrying send without blocks: %s",
+                            e,
+                        )
+                        last_result = await self._get_client(
+                            chat_id, team_id=self._metadata_team_id(metadata)
+                        ).chat_postMessage(**retry_kwargs)
+                    else:
+                        raise
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -1543,6 +1701,12 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         try:
             formatted = self.format_message(content)
+            # Slack's chat.update has the same ~40k char limit as postMessage.
+            # Unlike send() we can't split into multiple messages (we're
+            # editing an existing one), so truncate to fit — an oversized
+            # payload fails the whole edit with ``msg_too_long``.
+            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            formatted = chunks[0] if chunks else formatted
             update_kwargs: Dict[str, Any] = {
                 "channel": chat_id,
                 "ts": message_id,
@@ -1556,9 +1720,26 @@ class SlackAdapter(BasePlatformAdapter):
                 blocks = self._maybe_blocks(content)
                 if blocks:
                     update_kwargs["blocks"] = blocks
-            await self._get_client(
-                chat_id, team_id=self._metadata_team_id(metadata)
-            ).chat_update(**update_kwargs)
+            try:
+                await self._get_client(
+                    chat_id, team_id=self._metadata_team_id(metadata)
+                ).chat_update(**update_kwargs)
+            except Exception as e:
+                if update_kwargs.get("blocks") and self._is_block_payload_rejection(e):
+                    retry_kwargs = dict(update_kwargs)
+                    # Explicitly clear any stale blocks when falling back to the
+                    # flat text update path; otherwise Slack can preserve the
+                    # prior block layout for an edited message.
+                    retry_kwargs["blocks"] = []
+                    logger.info(
+                        "[Slack] Block Kit payload rejected; retrying edit without blocks: %s",
+                        e,
+                    )
+                    await self._get_client(
+                        chat_id, team_id=self._metadata_team_id(metadata)
+                    ).chat_update(**retry_kwargs)
+                else:
+                    raise
             if finalize:
                 await self.stop_typing(chat_id, metadata=metadata)
             return SendResult(success=True, message_id=message_id)
@@ -2010,6 +2191,31 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ----- Markdown → mrkdwn conversion -----
 
+    @staticmethod
+    def _is_block_payload_rejection(error: BaseException) -> bool:
+        """Return True for Slack errors recoverable by removing ``blocks``.
+
+        Rich Block Kit output is a progressive enhancement over the plain
+        ``text`` fallback. If Slack rejects the structured payload as invalid
+        or too large, retrying the same content without blocks is safe and
+        prevents a formatting bug from dropping the whole response.
+        """
+        recoverable_codes = {
+            "invalid_blocks",
+            "msg_too_long",
+            "too_many_blocks",
+        }
+        response = getattr(error, "response", None)
+        response_get = getattr(response, "get", None)
+        if callable(response_get):
+            try:
+                if response_get("error") in recoverable_codes:
+                    return True
+            except Exception:
+                pass
+        message = str(error)
+        return any(code in message for code in recoverable_codes)
+
     def _rich_blocks_enabled(self) -> bool:
         """Whether to render outbound agent messages as Slack Block Kit blocks.
 
@@ -2078,7 +2284,7 @@ class SlackAdapter(BasePlatformAdapter):
             return None
         try:
             blocks = render_blocks(content, mrkdwn_fn=self.format_message)
-            return self._append_feedback_block(blocks)
+            return sanitize_blocks(self._append_feedback_block(blocks))
         except Exception:  # pragma: no cover - renderer already guards itself
             logger.debug("[Slack] block render failed; using plain text", exc_info=True)
             return None
@@ -3127,8 +3333,14 @@ class SlackAdapter(BasePlatformAdapter):
             if allow_bots == "none":
                 return
             elif allow_bots == "mentions":
-                text_check = event.get("text", "")
+                # Include Block-Kit-only mentions, not just the flat text (#52387)
+                text_check = _slack_mention_detection_text(event)
                 if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
+                    logger.debug(
+                        "[Slack] Dropping bot message under allow_bots=mentions: "
+                        "no <@%s> mention in flat text or blocks",
+                        self._bot_user_id,
+                    )
                     return
             # "all" falls through to process the message
             # Always ignore our own messages to prevent echo loops
@@ -3348,7 +3560,8 @@ class SlackAdapter(BasePlatformAdapter):
         #   3. The message is in a thread where the bot was previously @mentioned, OR
         #   4. There's an existing session for this thread (survives restarts)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
-        routing_text = original_text or ""
+        # Detect mentions authored only inside Block Kit blocks too (#52387)
+        routing_text = _slack_mention_detection_text(event) or original_text or ""
         is_mentioned = bool(
             (bot_uid and f"<@{bot_uid}>" in routing_text)
             or self._slack_message_matches_mention_patterns(routing_text)
@@ -3874,7 +4087,7 @@ class SlackAdapter(BasePlatformAdapter):
             kwargs: Dict[str, Any] = {
                 "channel": chat_id,
                 "text": f"⚠️ Command approval required: {cmd_preview[:100]}",
-                "blocks": blocks,
+                "blocks": sanitize_blocks(blocks),
             }
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
@@ -3954,7 +4167,7 @@ class SlackAdapter(BasePlatformAdapter):
             kwargs: Dict[str, Any] = {
                 "channel": chat_id,
                 "text": f"{title or 'Confirm'}: {body[:100]}",
-                "blocks": blocks,
+                "blocks": sanitize_blocks(blocks),
             }
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
@@ -4098,6 +4311,11 @@ class SlackAdapter(BasePlatformAdapter):
                 original_text = block.get("text", {}).get("text", "")
                 break
 
+        # Slack re-escapes HTML entities in the interaction payload
+        # (< → &lt;, > → &gt;, & → &amp;), which can inflate the text
+        # past the 3000-char section-block limit on chat.update.
+        original_text = original_text[:3000]
+
         updated_blocks = [
             {
                 "type": "section",
@@ -4119,7 +4337,7 @@ class SlackAdapter(BasePlatformAdapter):
                 channel=channel_id,
                 ts=msg_ts,
                 text=decision_text,
-                blocks=updated_blocks,
+                blocks=sanitize_blocks(updated_blocks),
             )
         except Exception as e:
             logger.warning("[Slack] Failed to update slash-confirm message: %s", e)
@@ -4265,6 +4483,11 @@ class SlackAdapter(BasePlatformAdapter):
                 original_text = block.get("text", {}).get("text", "")
                 break
 
+        # Slack re-escapes HTML entities in the interaction payload
+        # (< → &lt;, > → &gt;, & → &amp;), which can inflate the text
+        # past the 3000-char section-block limit on chat.update.
+        original_text = original_text[:3000]
+
         updated_blocks = [
             {
                 "type": "section",
@@ -4286,7 +4509,7 @@ class SlackAdapter(BasePlatformAdapter):
                 channel=channel_id,
                 ts=msg_ts,
                 text=decision_text,
-                blocks=updated_blocks,
+                blocks=sanitize_blocks(updated_blocks),
             )
         except Exception as e:
             logger.warning("[Slack] Failed to update approval message: %s", e)
@@ -4294,6 +4517,57 @@ class SlackAdapter(BasePlatformAdapter):
         # (approval already resolved above; state consumed by atomic pop)
 
     # ----- Thread context fetching -----
+
+    @staticmethod
+    def _render_message_text(msg: dict, bot_uid: str = "") -> str:
+        """Return bounded display text for a Slack message, surfacing Block Kit content.
+
+        Starts with ``text``, strips bot mentions, then appends rich-text
+        content and actionable URLs from ``blocks`` when present.  Unlike
+        :func:`_serialize_slack_blocks_for_agent` (which can emit up to
+        6 000 chars of JSON per message), this helper produces only the
+        readable text and URL list needed by thread-context and parent-
+        text rendering — bounded by what the blocks actually contain,
+        not a JSON dump.
+        """
+        msg_text = (msg.get("text") or "").strip()
+        if bot_uid:
+            msg_text = msg_text.replace(f"<@{bot_uid}>", "").strip()
+
+        blocks = msg.get("blocks")
+        extras: list[str] = []
+        if blocks:
+            rich_text = _extract_text_from_slack_blocks(blocks).strip()
+            if rich_text and rich_text not in msg_text:
+                extras.append(rich_text)
+            for block in blocks:
+                block_type = (block or {}).get("type", "")
+                if block_type in ("section", "header", "context"):
+                    text_obj = block.get("text") or {}
+                    if isinstance(text_obj, dict):
+                        section_text = (text_obj.get("text") or "").strip()
+                        if section_text and section_text not in msg_text and all(section_text not in e for e in extras):
+                            extras.append(section_text)
+        # Legacy ``attachments`` (Alertmanager, Grafana, PagerDuty, CI bots):
+        # apps often post with an empty ``text`` and the real content in
+        # attachment fields or attachment-nested blocks.
+        attachments_text = _extract_text_from_slack_attachments(
+            msg.get("attachments") or []
+        ).strip()
+        if attachments_text and attachments_text not in msg_text and all(
+            attachments_text not in e for e in extras
+        ):
+            extras.append(attachments_text)
+        if blocks:
+            urls = _extract_urls_from_slack_blocks(blocks)
+            new_urls = [u for u in urls if u not in msg_text and all(u not in e for e in extras)]
+            if new_urls:
+                extras.append("URLs: " + ", ".join(new_urls))
+        if extras:
+            addendum = "\n".join(extras)
+            msg_text = (msg_text + "\n" + addendum).strip() if msg_text else addendum
+
+        return msg_text
 
     async def _fetch_thread_context(
         self,
@@ -4397,13 +4671,9 @@ class SlackAdapter(BasePlatformAdapter):
                 ):
                     continue
 
-                msg_text = msg.get("text", "").strip()
+                msg_text = self._render_message_text(msg, bot_uid=bot_uid)
                 if not msg_text:
                     continue
-
-                # Strip bot mentions from context messages
-                if bot_uid:
-                    msg_text = msg_text.replace(f"<@{bot_uid}>", "").strip()
 
                 prefix = "[thread parent] " if is_parent else ""
                 display_user = msg_user or "unknown"
@@ -4502,9 +4772,7 @@ class SlackAdapter(BasePlatformAdapter):
             if parent.get("ts", "") != thread_ts:
                 return ""
             bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
-            text = (parent.get("text") or "").strip()
-            if bot_uid:
-                text = text.replace(f"<@{bot_uid}>", "").strip()
+            text = self._render_message_text(parent, bot_uid=bot_uid or "")
             return text
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("[Slack] Failed to fetch thread parent text: %s", exc)
@@ -4945,6 +5213,14 @@ async def _standalone_send(
                 "Failed to apply Slack mrkdwn formatting in _standalone_send",
                 exc_info=True,
             )
+
+    if not formatted or not formatted.strip():
+        logger.debug("[Slack] _standalone_send: skipping empty/whitespace message")
+        return {
+            "success": True,
+            "platform": "slack",
+            "skipped": "empty_text",
+        }
 
     try:
         import aiohttp
