@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import concurrent.futures
+import functools
 import json
 import logging
 import os
@@ -172,23 +173,67 @@ _DESKTOP_WINDOW_NAMES = (
 _CUA_TELEMETRY_ENV_VAR = "CUA_DRIVER_RS_TELEMETRY_ENABLED"
 
 
-def _cua_telemetry_disabled() -> bool:
-    """True when Hermes should disable cua-driver telemetry for this user.
-
-    Reads ``computer_use.cua_telemetry`` from config.yaml. Default is False
-    (telemetry off). Any failure to read config fails SAFE — toward the
-    privacy-preserving default of telemetry disabled.
-    """
+def _computer_use_cfg() -> Dict[str, Any]:
+    """The ``computer_use`` config block, or ``{}`` when config is unreadable."""
     try:
         from hermes_cli.config import load_config
 
-        cfg = load_config() or {}
-        cu = cfg.get("computer_use") or {}
-        # opt-in flag: True => user wants telemetry => do NOT disable.
-        return not bool(cu.get("cua_telemetry", False))
+        return (load_config() or {}).get("computer_use") or {}
     except Exception:
-        # Config unreadable — default to disabling telemetry (fail safe).
+        return {}
+
+
+def _cua_no_overlay() -> bool:
+    """True when Hermes should pass ``--no-overlay`` to cua-driver.
+
+    Reads ``computer_use.no_overlay``. Default ``None`` (auto-detect):
+    disable the overlay where idle CPU burn is a known failure mode —
+    macOS (cursor-overlay vImage redraw loop, #28152/#47032), headless
+    Linux / WSL2 / containers — and keep it on Windows / desktop Linux
+    with a display. Explicit ``True`` / ``False`` overrides auto-detection.
+    """
+    val = _computer_use_cfg().get("no_overlay")
+    if val is not None:
+        return bool(val)
+    # Auto-detect: macOS overlay can peg a core indefinitely after a
+    # computer_use session (#47032). Prefer off until the driver teardown
+    # is solid; set computer_use.no_overlay: false to keep the cursor.
+    if sys.platform == "darwin":
         return True
+    if sys.platform != "linux":
+        return False
+    if not os.environ.get("DISPLAY"):
+        return True
+    try:
+        with open("/proc/version", encoding="utf-8") as f:
+            if "microsoft" in f.read().lower():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _cua_telemetry_disabled() -> bool:
+    """True when Hermes should disable cua-driver telemetry for this user.
+
+    Reads ``computer_use.cua_telemetry`` (default False → telemetry off).
+    Unreadable config falls SAFE toward disabling telemetry.
+    """
+    # opt-in flag: True => user wants telemetry => do NOT disable.
+    return not bool(_computer_use_cfg().get("cua_telemetry", False))
+
+
+def _computer_use_max_image_dimension() -> Optional[int]:
+    """Longest-edge cap for cua-driver screenshots, or None to leave unset.
+
+    Reads ``computer_use.max_image_dimension`` (default 1456, matching the
+    aux-vision downscale). ``0`` / negative / non-numeric → None.
+    """
+    try:
+        dim = int(_computer_use_cfg().get("max_image_dimension", 1456))
+    except (TypeError, ValueError):
+        return 1456
+    return dim if dim > 0 else None
 
 
 def cua_driver_child_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -301,6 +346,13 @@ def _resolve_mcp_invocation(
     Falls back to ``(driver_cmd, ["mcp"])`` for older drivers that don't
     expose ``manifest``, or any indeterminate failure — the wrapper must
     not refuse to start just because the discovery hop failed.
+
+    When ``computer_use.no_overlay`` is enabled (or auto-detected on
+    Linux), ``--no-overlay`` is appended to suppress the cursor overlay
+    rendering loop that can consume CPU indefinitely when idle
+    (#28152, #47032).  Older drivers that don't recognise the flag will
+    reject it; callers should fall back to the no-overlay invocation on
+    spawn failure.
     """
     try:
         from tools.environments.local import _sanitize_subprocess_env
@@ -314,33 +366,72 @@ def _resolve_mcp_invocation(
             env=_sanitize_subprocess_env(cua_driver_child_env()),
         )
     except Exception:
-        return driver_cmd, list(_CUA_DRIVER_ARGS)
+        return driver_cmd, _mcp_args_with_overlay_flag(list(_CUA_DRIVER_ARGS), driver_cmd=driver_cmd)
     out = (proc.stdout or "").strip()
     if proc.returncode != 0 or not out:
-        return driver_cmd, list(_CUA_DRIVER_ARGS)
+        return driver_cmd, _mcp_args_with_overlay_flag(list(_CUA_DRIVER_ARGS), driver_cmd=driver_cmd)
     try:
         manifest = json.loads(out)
     except (ValueError, TypeError):
-        return driver_cmd, list(_CUA_DRIVER_ARGS)
+        return driver_cmd, _mcp_args_with_overlay_flag(list(_CUA_DRIVER_ARGS), driver_cmd=driver_cmd)
     if not isinstance(manifest, dict):
-        return driver_cmd, list(_CUA_DRIVER_ARGS)
+        return driver_cmd, _mcp_args_with_overlay_flag(list(_CUA_DRIVER_ARGS), driver_cmd=driver_cmd)
     invocation = manifest.get("mcp_invocation")
     if not isinstance(invocation, dict):
-        return driver_cmd, list(_CUA_DRIVER_ARGS)
+        return driver_cmd, _mcp_args_with_overlay_flag(list(_CUA_DRIVER_ARGS), driver_cmd=driver_cmd)
     args = invocation.get("args")
     command = invocation.get("command")
     if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
-        return driver_cmd, list(_CUA_DRIVER_ARGS)
+        return driver_cmd, _mcp_args_with_overlay_flag(list(_CUA_DRIVER_ARGS), driver_cmd=driver_cmd)
     if not isinstance(command, str) or not command:
         # The driver knows the subcommand but didn't surface its own path.
         # Keep our resolved driver_cmd; the args are still authoritative.
-        return driver_cmd, args
+        return driver_cmd, _mcp_args_with_overlay_flag(args, driver_cmd=driver_cmd)
     if not _has_path_separator(command):
         # A manifest may legitimately retain the generic ``cua-driver`` name.
         # Under a GUI's thin PATH that would lose the resolved user-local path
         # and fail at MCP spawn, so preserve the concrete command we verified.
-        return driver_cmd, args
-    return command, args
+        return driver_cmd, _mcp_args_with_overlay_flag(args, driver_cmd=driver_cmd)
+    # Manifest surfaced a relocated executable — probe THAT binary for
+    # `--no-overlay` support rather than the system-resolved one, so a
+    # wrapper/relocation with a different feature set doesn't crash on
+    # an unknown flag (or silently keep an unwanted overlay).
+    return command, _mcp_args_with_overlay_flag(args, driver_cmd=command)
+
+
+def _mcp_args_with_overlay_flag(
+    args: List[str],
+    driver_cmd: str = _CUA_DRIVER_DEFAULT_CMD,
+) -> List[str]:
+    """Return *args* with ``--no-overlay`` appended when configured and supported."""
+    if _cua_no_overlay() and _cua_driver_supports_no_overlay(driver_cmd):
+        return [*args, "--no-overlay"]
+    return list(args)
+
+
+@functools.lru_cache(maxsize=1)
+def _cua_driver_supports_no_overlay(driver_cmd: str) -> bool:
+    """True if the installed cua-driver recognises ``--no-overlay``.
+
+    Probes ``<driver> --help`` once and caches the result.  Older
+    drivers (< 0.6.x) reject unknown flags, so passing ``--no-overlay``
+    would crash the MCP spawn.
+    """
+    try:
+        # cua-driver is a third-party binary — never hand it provider
+        # API keys via inherited env (same policy as the manifest probe
+        # and MCP spawn; #53503/#55709/#58889 lineage).
+        from tools.environments.local import _sanitize_subprocess_env
+        proc = subprocess.run(
+            [driver_cmd, "--help"],
+            capture_output=True, text=True, timeout=3.0,
+            stdin=subprocess.DEVNULL,
+            env=_sanitize_subprocess_env(cua_driver_child_env()),
+        )
+        help_text = (proc.stdout or "") + (proc.stderr or "")
+        return "--no-overlay" in help_text
+    except Exception:
+        return False
 
 # Regex to parse element lines from get_window_state AX tree markdown.
 #
@@ -1489,6 +1580,27 @@ class CuaDriverBackend(ComputerUseBackend):
             self._session.call_tool("start_session", {"session": self._session_id})
         except Exception as e:
             logger.debug("cua-driver start_session failed (continuing anonymous): %s", e)
+
+        # Post-handshake session tuning. Both guard on `_started`: before the
+        # handshake flips it, call_tool would re-enter session.start() (see
+        # _LIFECYCLE_CALLS) and tests that stub start() would recurse.
+        if self._session._started:
+            # Cap screenshot size so every later get_window_state / SOM
+            # capture pays less over the daemon socket and in the model turn.
+            max_dim = _computer_use_max_image_dimension()
+            if max_dim:
+                try:
+                    self.set_config(max_image_dimension=max_dim)
+                except Exception as e:
+                    logger.debug("cua-driver set_config(max_image_dimension) failed: %s", e)
+            # Belt-and-suspenders when --no-overlay is unsupported or ignored:
+            # hide the agent cursor overlay via the session API so macOS idle
+            # redraw loops cannot keep burning CPU after the first action.
+            if _cua_no_overlay():
+                try:
+                    self.set_agent_cursor_enabled(False, cursor_id=self._session_id)
+                except Exception as e:
+                    logger.debug("cua-driver set_agent_cursor_enabled failed: %s", e)
 
     def stop(self) -> None:
         # Tear the cua-driver session down before disconnecting so the
