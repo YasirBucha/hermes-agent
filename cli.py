@@ -10176,6 +10176,39 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     force=True,
                     defer_context_engine_notification=True,
                 )
+
+                # If _compress_context returned unchanged because a
+                # concurrent compression lock is held, tell the user
+                # clearly instead of showing the misleading
+                # "No changes from compression" no-op text. The wording
+                # distinguishes a confirmed holder from an unconfirmed
+                # acquisition failure (describe_compression_lock_skip).
+                # Type-pinned check (is True / str): the flag's only real
+                # values are None/True/holder-string, and a bare getattr
+                # truthiness test is fooled by MagicMock auto-attributes on
+                # test-double agents (skill pitfall: MagicMock vs hasattr).
+                _lock_skip_signal = getattr(
+                    self.agent, "_compression_skipped_due_to_lock", None
+                )
+                if _lock_skip_signal is True or isinstance(_lock_skip_signal, str):
+                    from agent.manual_compression_feedback import (
+                        describe_compression_lock_skip,
+                    )
+                    print(
+                        "  "
+                        + describe_compression_lock_skip(
+                            self.agent._compression_skipped_due_to_lock
+                        )
+                    )
+                    self.agent._compression_skipped_due_to_lock = None
+                    # No boundary was committed on a lock-skip; discard the
+                    # deferred context-engine notification (exactly-once).
+                    finalize_context_engine_compression_notification(
+                        self.agent,
+                        committed=False,
+                    )
+                    return
+
                 if partial and tail:
                     compressed = rejoin_compressed_head_and_tail(compressed, tail)
                 self.conversation_history = compressed

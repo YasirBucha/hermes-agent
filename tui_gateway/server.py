@@ -3642,6 +3642,14 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
         )
 
 
+class CompressionLockHeld(Exception):
+    """Raised by _compress_session_history when compression skipped due
+    to a concurrent lock on the session's compression_locks row."""
+    def __init__(self, holder: str | None = None):
+        self.holder = holder
+        super().__init__(f"Compression lock held: {holder or 'unknown'}")
+
+
 def _compress_session_history(
     session: dict,
     focus_topic: str | None = None,
@@ -3734,6 +3742,24 @@ def _compress_session_history(
             committed=False,
         )
         raise
+    # If _compress_context returned unchanged because a concurrent
+    # compression lock is held, raise so callers can surface a clear
+    # message instead of the misleading "No changes from compression" text.
+    # Type-pinned (is True / str): real values are None/True/holder-string;
+    # bare truthiness is fooled by MagicMock auto-attrs on test doubles.
+    _lock_skipped = getattr(agent, "_compression_skipped_due_to_lock", None)
+    if _lock_skipped is True or isinstance(_lock_skipped, str):
+        agent._compression_skipped_due_to_lock = None
+        # No boundary was committed on a lock-skip; discard any pending
+        # deferred context-engine notification (exactly-once, no-op safe).
+        finalize_context_engine_compression_notification(
+            agent,
+            committed=False,
+        )
+        raise CompressionLockHeld(
+            _lock_skipped if isinstance(_lock_skipped, str) else None
+        )
+
     if partial and tail:
         compressed = rejoin_compressed_head_and_tail(compressed, tail)
     with session["history_lock"]:
@@ -9346,6 +9372,16 @@ def _(rid, params: dict) -> dict:
             # reverts to neutral whether compaction succeeded, was a
             # no-op, or raised.
             _status_update(sid, "ready")
+    except CompressionLockHeld as e:
+        _status_update(sid, "ready")
+        from agent.manual_compression_feedback import (
+            describe_compression_lock_skip,
+        )
+        return _ok(rid, {
+            "compressed": False,
+            "lock_held": True,
+            "message": describe_compression_lock_skip(e.holder),
+        })
     except Exception as e:
         finalize_context_engine_compression_notification(
             session["agent"],
@@ -14469,6 +14505,19 @@ def _(rid, params: dict) -> dict:
                     ),
                 },
             )
+        except CompressionLockHeld as e:
+            # Lock-skip is a clean no-op, not a failure: report it as
+            # normal command output (matching the slash-mirror and
+            # session.compress RPC), never as a "compress failed" error.
+            # _compress_session_history already discarded the deferred
+            # context-engine notification before raising.
+            from agent.manual_compression_feedback import (
+                describe_compression_lock_skip,
+            )
+            return _ok(
+                rid,
+                {"type": "exec", "output": describe_compression_lock_skip(e.holder)},
+            )
         except Exception as exc:
             finalize_context_engine_compression_notification(
                 session["agent"],
@@ -15527,7 +15576,13 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             # (the choke point shared by all three manual-compress routes)
             # parses the boundary-aware forms (here [N], up to here, --keep N)
             # and does the partial head/tail split there (#35533).
-            _compress_session_history(session, arg)
+            try:
+                _compress_session_history(session, arg)
+            except CompressionLockHeld as e:
+                from agent.manual_compression_feedback import (
+                    describe_compression_lock_skip,
+                )
+                return describe_compression_lock_skip(e.holder)
             _sync_session_key_after_compress(sid, session)
 
             with session["history_lock"]:
