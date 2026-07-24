@@ -139,7 +139,8 @@ def _connect() -> sqlite3.Connection:
             escalation_reason TEXT,
             escalation_task_id TEXT,
             escalation_error TEXT,
-            receipt_json TEXT
+            receipt_json TEXT,
+            origin_session_id TEXT NOT NULL DEFAULT ''
         )"""
     )
     conn.execute(
@@ -169,6 +170,11 @@ def _connect() -> sqlite3.Connection:
         ("escalation_task_id", "TEXT"),
         ("escalation_error", "TEXT"),
         ("receipt_json", "TEXT"),
+        # Raw api_server session id (X-Hermes-Session-Id) of the ORIGINATING
+        # request — the wake self-post target. Without persisting it,
+        # completions recovered after a process restart are unroutable on
+        # api_server (the in-memory record that carried it is gone).
+        ("origin_session_id", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
@@ -291,15 +297,17 @@ def _persist_dispatch(record: Dict[str, Any]) -> Dict[str, Any]:
                 delivery_state, delivery_attempts, owner_pid,
                 owner_started_at, task_json, idempotency_key,
                 request_fingerprint, lease_expires_at,
-                escalation_state, escalation_attempts, escalation_max_attempts)
+                escalation_state, escalation_attempts, escalation_max_attempts,
+                origin_session_id)
                VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?,
-                       ?, ?, ?, 'not_required', 0, ?)""",
+                       ?, ?, ?, 'not_required', 0, ?, ?)""",
             (record["delegation_id"], record.get("session_key", ""),
              record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
              record["dispatched_at"], now, os.getpid(), owner_started_at,
              _canonical_json(task_payload), idempotency_key, fingerprint,
              now + lease_seconds,
-             int(record.get("escalation_max_attempts") or _DEFAULT_ESCALATION_MAX_ATTEMPTS)),
+             int(record.get("escalation_max_attempts") or _DEFAULT_ESCALATION_MAX_ATTEMPTS),
+             record.get("origin_session_id", "")),
         )
         _insert_audit(
             conn,
@@ -776,13 +784,14 @@ def recover_abandoned_delegations(
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
-                      owner_started_at, task_json, lease_expires_at
+                      owner_started_at, task_json, lease_expires_at,
+                      origin_session_id
                FROM async_delegations WHERE state IN ('running','finalizing')"""
         ).fetchall()
         for row in rows:
             (
                 delegation_id, session_key, origin_ui, parent_id, dispatched_at,
-                pid, started, task_json, lease_expires_at,
+                pid, started, task_json, lease_expires_at, origin_session_id,
             ) = row
             live = False
             if pid:
@@ -797,6 +806,9 @@ def recover_abandoned_delegations(
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
+                # Restore the durable wake target so completions recovered
+                # after a restart remain routable to api_server sessions.
+                "origin_session_id": origin_session_id or "",
                 "parent_session_id": parent_id, "goal": task.get("goal", ""),
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
@@ -1011,7 +1023,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
                       escalation_state, escalation_attempts,
                       escalation_max_attempts, escalation_next_at,
                       escalation_reason, escalation_task_id, escalation_error,
-                      receipt_json
+                      receipt_json, origin_session_id
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
         ).fetchone()
     if row is None:
@@ -1030,6 +1042,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
             "error": row[16],
         },
         "receipt": json.loads(row[17]) if row[17] else None,
+        "origin_session_id": row[18] or "",
     }
 
 
@@ -1165,6 +1178,34 @@ def _prune_completed_locked() -> None:
         _records.pop(rid, None)
 
 
+def _current_origin_session_id() -> str:
+    """Raw session id of the ORIGINATING api_server request, or ``""``.
+
+    The obvious source — ``HERMES_SESSION_ID`` via ``get_session_env`` — is
+    NOT safe to read at dispatch time: constructing a child agent
+    (``agent/agent_init.py``) calls ``set_current_session_id(child.session_id)``,
+    clobbering that ContextVar *and* ``os.environ`` with the subagent's
+    internal ``{timestamp}_{uuid}`` id moments before the dispatch code reads
+    it, so the completion wake would self-post into the subagent's own
+    (unread) session instead of the spawner's.
+
+    The request-scoped ``HERMES_SESSION_CHAT_ID`` binding survives child
+    construction: ``_bind_api_server_session`` binds ``chat_id`` to the raw
+    ``X-Hermes-Session-Id``, and its only writer is ``set_session_vars`` —
+    ``set_current_session_id`` never touches it. Gate on the platform: on
+    push platforms ``chat_id`` is a chat, not a session, so yield ``""``
+    there.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        if get_session_env("HERMES_SESSION_PLATFORM", "") != "api_server":
+            return ""
+        return get_session_env("HERMES_SESSION_CHAT_ID", "") or ""
+    except Exception:
+        return ""
+
+
 def dispatch_async_delegation(
     *,
     goal: str,
@@ -1176,6 +1217,7 @@ def dispatch_async_delegation(
     parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
+    origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
@@ -1229,6 +1271,7 @@ def dispatch_async_delegation(
         "model": model,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
+        "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -1369,6 +1412,7 @@ def _push_completion_event(
         # session; empty string => CLI (single-session) path.
         "session_key": record.get("session_key", ""),
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
+        "origin_session_id": record.get("origin_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
@@ -1413,6 +1457,7 @@ def dispatch_async_delegation_batch(
     parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
+    origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
@@ -1458,6 +1503,7 @@ def dispatch_async_delegation_batch(
         "model": model,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
+        "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -1581,6 +1627,7 @@ def _finalize_batch(
         "delegation_id": delegation_id,
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
+        "origin_session_id": event_record.get("origin_session_id", ""),
         "parent_session_id": event_record.get("parent_session_id"),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
