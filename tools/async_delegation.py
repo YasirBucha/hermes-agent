@@ -45,8 +45,9 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -103,11 +104,22 @@ def _db_path():
 
 
 def _connect() -> sqlite3.Connection:
-    from hermes_state import apply_wal_with_fallback
-
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
+    try:
+        _initialize_schema(conn)
+    except Exception:
+        # A PRAGMA/DDL failure after a successful connect() must not leak the
+        # just-opened connection back to the caller.
+        conn.close()
+        raise
+    return conn
+
+
+def _initialize_schema(conn: sqlite3.Connection) -> None:
+    from hermes_state import apply_wal_with_fallback
+
     apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS async_delegations (
@@ -191,7 +203,25 @@ def _connect() -> sqlite3.Connection:
         """CREATE INDEX IF NOT EXISTS idx_async_delegation_audit_parent
            ON async_delegation_audit(delegation_id, event_id)"""
     )
-    return conn
+
+
+@contextmanager
+def _transaction() -> Iterator[sqlite3.Connection]:
+    """Open a connection, commit/rollback on exit, and ALWAYS close it.
+
+    ``sqlite3.Connection.__enter__``/``__exit__`` only commit or roll back the
+    transaction; they do not close the connection. Using ``with _connect()``
+    alone therefore leaks a connection — and its WAL/SHM file descriptors — on
+    every durable dispatch, completion, and delivery-claim, deferring the close
+    to the garbage collector. On a long-running gateway that exhausts
+    ``RLIMIT_NOFILE`` (the cron-ledger sibling of this bug was #69567 / PR #69594).
+    """
+    conn = _connect()
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def _canonical_json(value: Any) -> str:
@@ -266,7 +296,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> Dict[str, Any]:
         for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch")
         if key in record
     }
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
             """SELECT delegation_id, request_fingerprint, state
@@ -326,7 +356,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _delete_durable_delegation(delegation_id: str) -> None:
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         conn.execute("DELETE FROM async_delegation_audit WHERE delegation_id=?", (delegation_id,))
         conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
 
@@ -335,7 +365,7 @@ def _prune_durable_records() -> None:
     """Bound terminal history, preferring delivered records for deletion."""
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         conn.execute(
             "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
             (cutoff,),
@@ -376,7 +406,7 @@ def _prune_durable_records() -> None:
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                event_json=?, result_json=?, delivery_state='pending',
@@ -398,7 +428,7 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         conn.execute(
             "UPDATE async_delegations SET delivery_attempts=delivery_attempts+1, updated_at=? WHERE delegation_id=?",
             (time.time(), delegation_id),
@@ -408,7 +438,7 @@ def _note_delivery_attempt(delegation_id: str) -> None:
 def _renew_lease(delegation_id: str, lease_seconds: int) -> bool:
     now = time.time()
     try:
-        with _DB_LOCK, _connect() as conn:
+        with _DB_LOCK, _transaction() as conn:
             cur = conn.execute(
                 """UPDATE async_delegations
                    SET lease_expires_at=?, updated_at=?
@@ -563,7 +593,7 @@ def _build_escalation_task(row: Dict[str, Any]) -> Dict[str, Any]:
 def _queue_escalation(delegation_id: str, reason: str) -> bool:
     now = time.time()
     safe_reason = str(_redact_audit_value(reason))[:2000]
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
             """UPDATE async_delegations
                SET escalation_state='pending', escalation_next_at=?,
@@ -608,7 +638,7 @@ def process_pending_escalations(
     clock = time.time() if now is None else float(now)
     processed = 0
     for _ in range(max(0, min(int(limit), 100))):
-        with _DB_LOCK, _connect() as conn:
+        with _DB_LOCK, _transaction() as conn:
             conn.execute(
                 """UPDATE async_delegations
                    SET escalation_state=CASE
@@ -682,7 +712,7 @@ def process_pending_escalations(
                 raise RuntimeError("AgentBroker response missing task_id")
             safe_response = _redact_audit_value(response)
             task_id = str(response["task_id"])
-            with _DB_LOCK, _connect() as conn:
+            with _DB_LOCK, _transaction() as conn:
                 conn.execute(
                     """UPDATE async_delegations
                        SET escalation_state='submitted', escalation_task_id=?,
@@ -707,7 +737,7 @@ def process_pending_escalations(
             safe_error = str(_redact_audit_value(f"{type(exc).__name__}: {exc}"))[:2000]
             exhausted = attempt >= item["escalation_max_attempts"]
             backoff = min(2 ** max(0, attempt - 1), 60)
-            with _DB_LOCK, _connect() as conn:
+            with _DB_LOCK, _transaction() as conn:
                 conn.execute(
                     """UPDATE async_delegations
                        SET escalation_state=?, escalation_next_at=?,
@@ -746,7 +776,7 @@ def _failure_reason(status: str, result: Dict[str, Any]) -> Optional[str]:
 
 def _attach_escalation_to_event(event: Dict[str, Any]) -> None:
     delegation_id = str(event.get("delegation_id") or "")
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
             """SELECT escalation_state, escalation_attempts,
                       escalation_max_attempts, escalation_task_id,
@@ -780,7 +810,7 @@ def recover_abandoned_delegations(
         return 0
     now = time.time()
     recovered_events: List[Dict[str, Any]] = []
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
@@ -859,7 +889,7 @@ def restore_undelivered_completions(target_queue) -> int:
     """
     recover_abandoned_delegations()
     process_pending_escalations()
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT delegation_id, event_json, escalation_state,
                       escalation_attempts, escalation_max_attempts,
@@ -891,7 +921,7 @@ def restore_undelivered_completions(target_queue) -> int:
 def mark_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
                WHERE delegation_id=? AND delivery_state!='delivered'""",
@@ -903,7 +933,7 @@ def mark_completion_delivered(delegation_id: str) -> bool:
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Claim one pending completion across competing consumers/processes."""
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
             "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
             (delegation_id,),
@@ -942,7 +972,7 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     pending rows).
     """
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         capped = conn.execute(
             """UPDATE async_delegations SET delivery_state='dropped',
                       delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
@@ -977,7 +1007,7 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     completion that will be fail-closed dropped again every time.
     """
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='dropped',
                       updated_at=?, delivery_claim=NULL,
@@ -992,7 +1022,7 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Acknowledge acceptance for the consumer holding this claim."""
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered',
                       delivered_at=?, updated_at=?, delivery_claim=NULL,
@@ -1015,7 +1045,7 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
@@ -1048,7 +1078,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
 
 def get_delegation_audit(delegation_id: str, *, limit: int = 100) -> List[Dict[str, Any]]:
     bounded = max(1, min(int(limit), 500))
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT event_id, event_type, created_at, data_json
                FROM async_delegation_audit WHERE delegation_id=?
@@ -1092,7 +1122,7 @@ def refresh_delegation_receipt(
     snapshot = _redact_audit_value(
         {"task": task, "receipt": receipt, "updated_at": updated_at}
     )
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _transaction() as conn:
         conn.execute(
             "UPDATE async_delegations SET receipt_json=?, updated_at=? WHERE delegation_id=?",
             (_canonical_json(snapshot), updated_at, delegation_id),
