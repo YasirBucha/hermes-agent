@@ -309,6 +309,31 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
+# Import-time snapshot used by _default_db_path() to detect a deliberately
+# re-pointed DEFAULT_DB_PATH (tests monkeypatch the constant directly).
+_IMPORT_DEFAULT_DB_PATH = DEFAULT_DB_PATH
+
+
+def _default_db_path() -> Path:
+    """Resolve the default state DB path at call time.
+
+    ``DEFAULT_DB_PATH`` is computed when this module is first imported, which
+    freezes the developer's real ``~/.hermes`` even when a test fixture later
+    redirects ``HERMES_HOME`` — importing this module during collection was
+    enough to point every default ``SessionDB()`` at the real state.db.
+
+    Precedence:
+
+    1. A deliberately re-pointed ``DEFAULT_DB_PATH`` (differs from the
+       import-time snapshot — the established test escape hatch) wins.
+    2. Otherwise resolve ``get_hermes_home()`` fresh so a runtime
+       ``HERMES_HOME`` redirect takes effect regardless of import order.
+    """
+    if DEFAULT_DB_PATH != _IMPORT_DEFAULT_DB_PATH:
+        return DEFAULT_DB_PATH
+    return get_hermes_home() / "state.db"
+
+
 SCHEMA_VERSION = 23
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -325,6 +350,132 @@ FTS_STORAGE_VERSION = 1
 # Search queries do not need to be arbitrarily large, and bounding them keeps
 # sanitizer/runtime behavior predictable under adversarial input.
 MAX_FTS5_QUERY_CHARS = 2_048
+
+
+# ---------------------------------------------------------------------------
+# Live-DB test-isolation guard
+# ---------------------------------------------------------------------------
+# Forensic evidence (Aug 2026, live developer machine): the production
+# ~/.hermes/state.db accumulated pytest fixture rows — sessions with
+# chat_id='chat-1'/'123'/'wx-chat' and gateway_routing scopes literally under
+# /tmp/pytest-of-*/ — and a pytest-spawned process flipped the journal mode
+# out from under the WAL-mode gateway writer, destroying committed
+# transcripts ("Persisted transcript lagged live cached history ... possible
+# FTS write corruption").  The hermetic conftest redirects HERMES_HOME per
+# test, but any escape (a session-scoped fixture running before the autouse
+# fixture, a subprocess child launched without HERMES_HOME, a stale worktree
+# without the re-pin, or a developer shell that exports HERMES_HOME to the
+# real home so the conftest session sandbox is skipped) silently fell
+# through to the real database.
+#
+# This guard is the single choke point: EVERY ``SessionDB`` construction
+# resolves its path here, so under pytest a resolution that lands on a
+# production state.db fails hard instead of corrupting live data.  It is
+# env-based (``PYTEST_CURRENT_TEST`` / ``PYTEST_VERSION`` are set by pytest
+# and inherited by subprocess children), so it also protects children that
+# never import the test conftest.
+
+#: Escape hatch for the rare legitimate case (a test that genuinely needs
+#: the real DB).  The in-tree conftest sets this for tests marked
+#: ``@pytest.mark.live_system_guard_bypass``; scripts may set it explicitly.
+_STATE_DB_GUARD_BYPASS = False
+
+#: Additional production roots to refuse (beyond the platform default
+#: ``~/.hermes``).  The test conftest injects the pre-sandbox production
+#: root here so custom-``HERMES_HOME`` deployments are covered too.
+_STATE_DB_GUARD_EXTRA_DENY_ROOTS: Tuple[Path, ...] = ()
+
+
+def _real_platform_state_root() -> Optional[Path]:
+    """Resolve the REAL platform-default Hermes root for the guard.
+
+    Deliberately avoids ``Path.home()`` / ``hermes_constants``: tests
+    routinely monkeypatch ``Path.home`` to a tempdir, and ``hermes_state``
+    is often imported lazily *while* such a patch is active — resolving
+    through the patched callable would misidentify the test's own hermetic
+    home as "production" (false positive) or, worse, miss the real one
+    (false negative).  ``os.path.expanduser`` reads the HOME environment
+    variable / passwd entry, which the hermetic conftest never rewrites.
+    """
+    try:
+        if sys.platform == "win32":
+            base = os.environ.get("LOCALAPPDATA", "").strip()
+            root = (
+                Path(base) / "hermes"
+                if base
+                else Path(os.path.expanduser("~")) / "AppData" / "Local" / "hermes"
+            )
+        else:
+            root = Path(os.path.expanduser("~")) / ".hermes"
+        return root.resolve()
+    except Exception:
+        return None
+
+
+def _running_under_pytest() -> bool:
+    """True when this process (or a parent test process) is a pytest run."""
+    return bool(
+        os.environ.get("PYTEST_CURRENT_TEST")
+        or os.environ.get("PYTEST_VERSION")
+    )
+
+
+def _production_state_roots() -> List[Path]:
+    roots: List[Path] = []
+    real_root = _real_platform_state_root()
+    if real_root is not None:
+        roots.append(real_root)
+    for extra in _STATE_DB_GUARD_EXTRA_DENY_ROOTS:
+        try:
+            roots.append(Path(extra).expanduser().resolve())
+        except Exception:
+            continue
+    return roots
+
+
+def _is_production_state_db(resolved: Path, root: Path) -> bool:
+    """True when *resolved* is a DB file of the real Hermes home *root*.
+
+    Matches files directly in the root (``<root>/state.db``) and profile
+    homes (``<root>/profiles/<name>/state.db``).  Deliberately does NOT
+    match deeper scratch paths (e.g. repo worktrees that happen to live
+    under ``~/.hermes/hermes-agent/...``) so hermetic tests using unusual
+    tempdirs cannot false-positive.
+    """
+    if resolved.parent == root:
+        return True
+    try:
+        rel = resolved.relative_to(root)
+    except ValueError:
+        return False
+    parts = rel.parts
+    return len(parts) == 3 and parts[0] == "profiles"
+
+
+def _ensure_test_isolation(db_path: Path) -> None:
+    """Fail hard when a pytest-context process resolves a production DB.
+
+    Raises ``RuntimeError`` before any connection, mkdir, journal-mode
+    pragma, or byte probe can touch the live database.  No-op outside
+    pytest and for hermetic (tmp ``HERMES_HOME``) paths.
+    """
+    if _STATE_DB_GUARD_BYPASS or not _running_under_pytest():
+        return
+    try:
+        resolved = Path(db_path).expanduser().resolve()
+    except Exception:
+        return
+    for root in _production_state_roots():
+        if _is_production_state_db(resolved, root):
+            raise RuntimeError(
+                "live-system guard: test attempted to open production "
+                f"state.db at {resolved} (under real Hermes root {root}). "
+                "Tests must run against a temporary HERMES_HOME — pass an "
+                "explicit tmp db_path or let the hermetic conftest redirect "
+                "HERMES_HOME. If this test genuinely needs the live "
+                "database, mark it with "
+                "@pytest.mark.live_system_guard_bypass."
+            )
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -608,6 +759,32 @@ def sqlite_source_id() -> str:
     return str(row[0])
 
 
+def resolve_journal_mode() -> str:
+    """Return the configured journal mode (``wal`` or ``delete``).
+
+    ``database.journal_mode`` in config.yaml is the canonical operator
+    setting. ``wal`` remains the default; use ``delete`` when the backing
+    filesystem does not provide WAL-safe durability (for example macOS
+    virtiofs, NFS, or SMB). Invalid or malformed values fail safely to the
+    existing default.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        database = config.get("database", {})
+        if not isinstance(database, dict):
+            return "wal"
+        raw = database.get("journal_mode", "wal")
+    except Exception:
+        return "wal"
+
+    if not isinstance(raw, str):
+        return "wal"
+    mode = raw.strip().lower()
+    return mode if mode in ("wal", "delete") else "wal"
+
+
 def apply_wal_with_fallback(
     conn: sqlite3.Connection,
     *,
@@ -651,20 +828,49 @@ def apply_wal_with_fallback(
     _on_disk_journal_mode.  That holds for both the NFS path and the
     WAL-reset vulnerability path.
     """
-    # Vulnerable SQLite: do not enable WAL on new/non-WAL files.
+    configured = resolve_journal_mode()
+
+    # Vulnerable SQLite: do not enable WAL on new/non-WAL files. Resolve the
+    # operator setting first so an explicit DELETE request still verifies that
+    # SQLite actually accepted DELETE rather than silently returning MEMORY or
+    # another connection-specific mode.
     if is_sqlite_wal_reset_vulnerable():
-        return _apply_delete_for_wal_reset_bug(conn, db_label=db_label)
+        return _apply_delete_for_wal_reset_bug(
+            conn,
+            db_label=db_label,
+            require_delete=configured == "delete",
+        )
 
     # Read-only probe — no flock, no checkpoint, no WAL/SHM unlink.
     # Skipping the set-pragma prevents WAL-init from unlinking files other connections hold open.
-    try:
-        current_mode = conn.execute("PRAGMA journal_mode").fetchone()
-        if current_mode and current_mode[0] == "wal":
-            _apply_macos_checkpoint_barrier(conn)
-            _enforce_macos_synchronous_full(conn)
-            return "wal"
-    except sqlite3.OperationalError:
-        pass
+    current_mode = _on_disk_journal_mode(conn)
+    if current_mode == "wal":
+        _apply_macos_checkpoint_barrier(conn)
+        _enforce_macos_synchronous_full(conn)
+        return "wal"
+
+    # #68545: honor the canonical database.journal_mode setting. Existing
+    # on-disk WAL databases were returned above and are never live-downgraded.
+    if configured == "delete":
+        if current_mode is None:
+            # The mode probe failed (database locked / busy): another
+            # process may hold this DB open in WAL. Ownership is not
+            # provably exclusive, so flipping journal modes here could
+            # destroy committed-but-uncheckpointed WAL transactions of a
+            # concurrent writer. Fail loudly instead of downgrading — the
+            # operator explicitly requested DELETE and we cannot verify it.
+            raise sqlite3.OperationalError(
+                "could not verify journal mode before applying configured "
+                "journal_mode=delete (database is locked — possible "
+                "concurrent openers); refusing to downgrade a database "
+                "this process does not exclusively own"
+            )
+        actual = _set_journal_mode_no_wait(conn, "DELETE")
+        if actual != "delete":
+            raise sqlite3.OperationalError(
+                f"could not set configured journal_mode=delete (got {actual or 'no result'})"
+            )
+        return actual
 
     try:
         conn.execute("PRAGMA journal_mode=WAL")
@@ -676,32 +882,103 @@ def apply_wal_with_fallback(
         if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
             # Unrelated OperationalError — don't silently swallow.
             raise
-        # Don't downgrade if another process already set WAL on disk.
+        # ``disk i/o error`` is ambiguous: on ZFS / APFS-CoW it is a
+        # deterministic WAL-incompatibility (SHM corruption under concurrent
+        # connection bursts — #55305, #71498), but it can also be a one-shot
+        # transient EIO (page-cache pressure, brief lock contention).
+        # Treating a transient EIO as a permanent downgrade signal produced
+        # the mixed-journal-mode corruption pattern fixed in 5c49cd0ed0
+        # (process A downgrades to DELETE while sibling processes set WAL).
+        # Disambiguate by retrying the pragma a couple of times: transient
+        # EIO clears and we return "wal"; the deterministic filesystem cases
+        # keep failing and fall through to the guarded DELETE fallback.
+        if "disk i/o error" in msg:
+            for _ in range(2):
+                time.sleep(0.05)
+                try:
+                    row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                except sqlite3.OperationalError as retry_exc:
+                    if "disk i/o error" not in str(retry_exc).lower():
+                        raise
+                    exc = retry_exc
+                    continue
+                mode = (
+                    str(row[0]).strip().lower()
+                    if row and row[0] is not None
+                    else ""
+                )
+                if mode == "wal":
+                    _apply_macos_checkpoint_barrier(conn)
+                    _enforce_macos_synchronous_full(conn)
+                    return "wal"
+                break
+        # Don't downgrade if another process already set WAL on disk, or if
+        # the mode cannot be verified at all (probe blocked by a concurrent
+        # opener's locks) — ownership is not provably exclusive either way.
         existing = _on_disk_journal_mode(conn)
-        if existing == "wal":
+        if existing == "wal" or existing is None:
             raise
         _log_wal_fallback_once(db_label, exc)
-        conn.execute("PRAGMA journal_mode=DELETE")
+        _set_journal_mode_no_wait(conn, "DELETE")
         return "delete"
+
+
+def _set_journal_mode_no_wait(conn: sqlite3.Connection, mode: str) -> str:
+    """Execute ``PRAGMA journal_mode=<mode>`` without waiting on other openers.
+
+    This is the ONLY place a journal-mode switch pragma may be issued for a
+    non-WAL target.  It temporarily forces ``busy_timeout=0`` so SQLite's own
+    exclusivity requirement becomes a concurrent-opener detector: leaving WAL
+    mode requires exclusive access to the database, so if ANY other connection
+    (this process or another) holds the DB open, the pragma fails immediately
+    with ``database is locked`` instead of waiting out a busy timeout and
+    sneaking the flip in between a concurrent writer's transactions — which is
+    exactly how committed-but-uncheckpointed WAL transactions get destroyed.
+
+    Callers must treat a raised ``OperationalError`` as "not exclusively
+    owned: leave the journal mode alone", never as a retryable condition.
+
+    Returns the resulting journal mode as reported by SQLite (lowercase), or
+    ``""`` when SQLite returned no row.
+    """
+    previous_timeout = 0
+    try:
+        row = conn.execute("PRAGMA busy_timeout").fetchone()
+        if row and row[0] is not None:
+            previous_timeout = int(row[0])
+    except (sqlite3.OperationalError, TypeError, ValueError):
+        previous_timeout = 0
+    conn.execute("PRAGMA busy_timeout=0")
+    try:
+        row = conn.execute(f"PRAGMA journal_mode={mode}").fetchone()
+        return str(row[0]).strip().lower() if row and row[0] is not None else ""
+    finally:
+        try:
+            conn.execute(f"PRAGMA busy_timeout={previous_timeout}")
+        except sqlite3.OperationalError:
+            pass
 
 
 def _apply_delete_for_wal_reset_bug(
     conn: sqlite3.Connection,
     *,
     db_label: str,
+    require_delete: bool = False,
 ) -> str:
     """Avoid enabling WAL when the linked SQLite has the WAL-reset bug.
 
     - Already-WAL on disk: leave WAL alone (no live downgrade) and warn.
-    - Otherwise: set DELETE and warn.
+    - Mode unreadable (probe blocked by a concurrent opener's locks):
+      ownership is not provably exclusive — leave the journal mode alone
+      and warn.  Never treat "could not read the mode" as "not WAL": that
+      exact confusion let a vulnerable-SQLite process flip a live WAL
+      state.db to DELETE under a concurrent WAL writer, destroying its
+      committed-but-uncheckpointed transactions.
+    - Otherwise: set DELETE (refusing to wait out concurrent openers) and
+      warn.
+    - For an explicit operator request, verify SQLite accepted DELETE.
     """
-    current = ""
-    try:
-        row = conn.execute("PRAGMA journal_mode").fetchone()
-        if row and row[0] is not None:
-            current = str(row[0]).strip().lower()
-    except sqlite3.OperationalError:
-        current = ""
+    current = _on_disk_journal_mode(conn)
 
     if current == "wal":
         # Do not TRUNCATE / journal_mode=DELETE while other processes may
@@ -711,41 +988,111 @@ def _apply_delete_for_wal_reset_bug(
         _enforce_macos_synchronous_full(conn)
         return "wal"
 
+    if current is None:
+        # The mode probe itself failed — another opener's locks are the
+        # most likely cause, and the DB may well be in WAL under a live
+        # writer.  Never flip a journal mode we cannot even read.
+        if require_delete:
+            raise sqlite3.OperationalError(
+                "could not verify journal mode before applying configured "
+                "journal_mode=delete (database is locked — possible "
+                "concurrent openers); refusing to downgrade a database "
+                "this process does not exclusively own"
+            )
+        _log_wal_reset_bug_once(db_label, kept_wal=True, indeterminate=True)
+        return "wal"
+
+    actual = ""
     try:
-        conn.execute("PRAGMA journal_mode=DELETE")
-    except sqlite3.OperationalError:
-        # Best-effort: DELETE is usually already the default for new files.
-        pass
+        actual = _set_journal_mode_no_wait(conn, "DELETE")
+    except sqlite3.OperationalError as exc:
+        if require_delete:
+            raise
+        lowered = str(exc).lower()
+        if "locked" in lowered or "busy" in lowered:
+            # A concurrent opener appeared between the probe and the flip
+            # (or already held the DB): SQLite refused the exclusive lock.
+            # Leave the journal mode exactly as it is.
+            _log_wal_reset_bug_once(db_label, kept_wal=True, indeterminate=True)
+            return current or "delete"
+        # Best-effort for the automatic vulnerable-runtime fallback: DELETE is
+        # normally already the default for new file-backed databases.
+    if require_delete and actual != "delete":
+        raise sqlite3.OperationalError(
+            "could not set configured journal_mode=delete "
+            f"(got {actual or 'no result'})"
+        )
     _log_wal_reset_bug_once(db_label, kept_wal=False)
     return "delete"
+
+
+def _wal_reset_repair_hint() -> str:
+    """Return a context-appropriate hint for repairing the SQLite runtime.
+
+    Uses the codebase's install-type detection so the hint matches what
+    ``hermes update`` can actually do for this install (#75153).
+    """
+    try:
+        from hermes_cli.config import (
+            detect_install_method,
+            recommended_update_command_for_method,
+            get_project_root,
+        )
+        method = detect_install_method(get_project_root())
+        cmd = recommended_update_command_for_method(method)
+        if method in {"git", "unknown"}:
+            return f"Hermes-managed installs can repair the embedded runtime with `{cmd}`"
+        if method == "docker":
+            return f"update the container image with `{cmd}`"
+        # nix/nixos
+        return cmd
+    except Exception:
+        pass
+    return (
+        "install a Python build bundled with SQLite 3.51.3+ "
+        "(or backports 3.50.7 / 3.44.6) and restart Hermes"
+    )
 
 
 def _log_wal_reset_bug_once(
     db_label: str,
     *,
     kept_wal: bool,
+    indeterminate: bool = False,
 ) -> None:
     """Log once per (process, db_label) about the WAL-reset vulnerability path."""
     with _wal_reset_bug_warned_lock:
         if db_label in _wal_reset_bug_warned_paths:
             return
         _wal_reset_bug_warned_paths.add(db_label)
-    action = (
-        "is already in WAL mode — leaving WAL in place (no live "
-        "downgrade under concurrent openers)"
-        if kept_wal
-        else "using journal_mode=DELETE instead of enabling WAL"
-    )
+    if indeterminate:
+        action = (
+            "journal mode could not be verified or exclusively switched "
+            "(database is locked — possible concurrent openers); leaving the "
+            "journal mode untouched (no live downgrade under concurrent "
+            "openers)"
+        )
+    elif kept_wal:
+        action = (
+            "is already in WAL mode — leaving WAL in place (no live "
+            "downgrade under concurrent openers)"
+        )
+    else:
+        action = "using journal_mode=DELETE instead of enabling WAL"
+    # Check whether this is a Hermes-managed install (uv-managed venv)
+    # so the warning doesn't promise a repair path that doesn't exist
+    # for git/pip/system Python installs (#75153).
+    repair_hint = _wal_reset_repair_hint()
     logger.warning(
         "%s: linked SQLite %s is vulnerable to the WAL-reset corruption "
         "bug (https://sqlite.org/wal.html#walresetbug) — %s. "
         "Upgrade to SQLite 3.51.3+ (or backports 3.50.7 / 3.44.6); "
-        "Hermes-managed installs can repair the embedded runtime with "
-        "`hermes update`. See `hermes doctor`. This warning fires once per "
+        "%s. See `hermes doctor`. This warning fires once per "
         "process per database.",
         db_label,
         sqlite3.sqlite_version,
         action,
+        repair_hint,
     )
 
 
@@ -1959,7 +2306,11 @@ class SessionDB:
     _IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = db_path or _default_db_path()
+        # Fail hard (before any connection/pragma/mkdir) if a pytest-context
+        # process resolved the developer's production state.db — see the
+        # live-DB test-isolation guard block near _default_db_path().
+        _ensure_test_isolation(self.db_path)
         self.read_only = read_only
 
         self._lock = threading.Lock()
