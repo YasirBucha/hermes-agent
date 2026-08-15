@@ -1384,7 +1384,11 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     monkeypatch.setattr(dt, "_run_single_child", _blocking_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
     out = dt.delegate_task(
-        tasks=[{"goal": "a"}, {"goal": "b"}, {"goal": "c"}],
+        tasks=[
+            {"goal": "complete task a"},
+            {"goal": "complete task b"},
+            {"goal": "complete task c"},
+        ],
         background=True,
         parent_agent=parent,
     )
@@ -1394,7 +1398,11 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert parsed["mode"] == "background"
     assert parsed["count"] == 3
     assert parsed["delegation_id"].startswith("deleg_")
-    assert parsed["goals"] == ["a", "b", "c"]
+    assert parsed["goals"] == [
+        "complete task a",
+        "complete task b",
+        "complete task c",
+    ]
     # ONE background unit for the whole fan-out (not three), and the call
     # returned while all children are still blocked → chat not blocked.
     assert process_registry.completion_queue.empty()
@@ -1408,12 +1416,18 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert evt.get("is_batch") is True
     assert len(evt["results"]) == 3
     summaries = sorted(r["summary"] for r in evt["results"])
-    assert summaries == ["done: a", "done: b", "done: c"]
+    assert summaries == [
+        "done: complete task a",
+        "done: complete task b",
+        "done: complete task c",
+    ]
     # The consolidated notification names all three tasks in one block.
     text = format_process_notification(evt)
     assert text is not None
     assert "TASK 1/3" in text and "TASK 2/3" in text and "TASK 3/3" in text
-    assert "done: a" in text and "done: b" in text and "done: c" in text
+    assert all(
+        f"done: complete task {suffix}" in text for suffix in ("a", "b", "c")
+    )
     # No more events — it's a single combined completion, not N of them.
     assert _drain_one() is None
 
