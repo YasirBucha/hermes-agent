@@ -323,6 +323,8 @@ def create_live_transcripts(
     task_list: List[Dict[str, Any]],
     context: Optional[str] = None,
     delegation_id: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> tuple[Optional[str], List[Optional[LiveTranscriptWriter]], List[str]]:
     """Create one pre-headered writer per task + a manifest.json.
 
@@ -352,7 +354,9 @@ def create_live_transcripts(
         # A replay of the same stable delegation id must not reset a terminal
         # manifest to "running" or replace its original task metadata.
         if not _manifest_path(deleg_id).exists():
-            _write_manifest(deleg_id, task_list, paths)
+            _write_manifest(
+                deleg_id, task_list, paths, model=model, provider=provider
+            )
         return deleg_id, writers, paths
     except Exception as exc:
         logger.debug("Live transcript creation failed: %s", exc)
@@ -364,12 +368,15 @@ def _manifest_path(delegation_id: str) -> Path:
 
 
 def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
-                    paths: List[str]) -> None:
+                    paths: List[str], model: Optional[str] = None,
+                    provider: Optional[str] = None) -> None:
     try:
         manifest = {
             "delegation_id": delegation_id,
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
             "task_count": len(task_list),
+            "model": model,
+            "provider": provider,
             "tasks": [
                 {
                     "index": i,
