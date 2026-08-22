@@ -59,6 +59,9 @@ class TestProviderEnvDetection:
         content = "OPENAI_BASE_URL=http://localhost:1234/v1\nOPENAI_API_KEY=***"
         assert _has_provider_env_config(content)
 
+    def test_detects_ollama_cloud_api_key(self):
+        assert _has_provider_env_config("OLLAMA_API_KEY=***\n")
+
 
     def test_returns_false_when_no_provider_settings(self):
         content = "TERMINAL_ENV=local\n"
