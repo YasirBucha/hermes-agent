@@ -25,5 +25,16 @@
     "fromAgentBroker": "perform scheduled or delegated read-only work and return durable receipts",
     "toTony": "deliver concise executive recommendations and escalation notices",
     "toOpenClaw": "request approval-gated local execution through AgentBroker only"
+  },
+  "metadata": {
+    "captureV1": {
+      "role": "consumer",
+      "contractVersion": "1.0",
+      "platforms": [
+        "local-agent"
+      ],
+      "transport": "contract-only",
+      "status": "implemented"
+    }
   }
 }

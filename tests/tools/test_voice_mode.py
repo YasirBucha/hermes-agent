@@ -1376,6 +1376,7 @@ class TestDefaultInputSamplerate:
             assert wf.getframerate() == 48000
 
 
+@pytest.mark.linux_only
 class TestWSL2PowerShellFallback:
     """Regression tests for WSL2 PowerShell TTS fallback (issue #17608).
 
@@ -1520,6 +1521,7 @@ class TestWSL2PowerShellFallback:
             )
 
 
+@pytest.mark.linux_only
 class TestWSLAudioEnvironmentGate:
     """Regression tests (review of #63768) for detect_audio_environment()'s
     WSL gate: when the PowerShell TTS fallback is viable, voice mode must
