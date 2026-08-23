@@ -12,7 +12,7 @@ const reactUi: TestProjectConfiguration = {
     // UI files perform large Vite/React transforms. Using every logical CPU
     // starves jsdom workers under the full release gate and turns async UI
     // assertions into timeouts even though the same files pass alone.
-    maxWorkers: '50%',
+    maxWorkers: 4,
     // The first test in each file pays jsdom env init + full module transform,
     // which can exceed vitest's 5000ms default under CI/load. 15s gives the
     // cold start headroom without masking genuinely hung tests.
@@ -24,6 +24,7 @@ const electronNative: TestProjectConfiguration = {
   test: {
     name: 'electron',
     environment: 'node',
+    maxWorkers: 4,
     include: ['electron/**/*.test.ts', 'scripts/**.test.{ts,mjs}'],
     exclude: ['scripts/run-short-session-hang-repro.test.mjs']
   }
