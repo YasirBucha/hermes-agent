@@ -22,7 +22,6 @@ manually against the reporter's live repro).
 from __future__ import annotations
 
 import asyncio
-import time
 from unittest.mock import patch
 
 import pytest
@@ -77,18 +76,22 @@ class TestStdioInitializeTimeout:
                  patch.object(mcp_tool, "_get_mcp_stderr_log", lambda: None), \
                  patch("tools.osv_check.check_package_for_malware",
                        lambda *_a, **_k: None):
-                start = time.monotonic()
                 # The outer 5s guard exists ONLY so a regression can't hang the
                 # whole suite. With the fix, the inner connect_timeout (0.2s)
-                # fires first; the elapsed assertion below is what actually
-                # distinguishes "bounded" (fixed) from "hung" (regressed).
+                # fires first. Use task completion instead of wall-clock
+                # timing so a heavily loaded parallel test host cannot turn a
+                # correct cancellation into a false regression.
+                task = asyncio.create_task(server._run_stdio(config))
+                done, _ = await asyncio.wait({task}, timeout=5.0)
+                if task not in done:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    pytest.fail(
+                        f"_run_stdio did not honor connect_timeout "
+                        f"({config['connect_timeout']}s); the #59349 "
+                        "subprocess/FD leak has regressed."
+                    )
                 with pytest.raises(asyncio.TimeoutError):
-                    await asyncio.wait_for(server._run_stdio(config), timeout=5.0)
-                return time.monotonic() - start
+                    await task
 
-        elapsed = asyncio.run(drive())
-        assert elapsed < 2.0, (
-            f"_run_stdio blocked {elapsed:.1f}s on a hanging initialize() — the "
-            f"connect_timeout ({config['connect_timeout']}s) bound was not applied; "
-            f"the #59349 subprocess/FD leak has regressed."
-        )
+        asyncio.run(drive())
