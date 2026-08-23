@@ -206,7 +206,7 @@ def test_execute_code_approved_clears_stale_interrupt_bit(monkeypatch):
     assert is_interrupted()
 
     result = json.loads(execute_code(
-        code='import time; time.sleep(0.5); print("CODE_DONE")',
+        code='import time; time.sleep(2); print("CODE_DONE")',
         task_id="test-clean-slate",
     ))
 
@@ -232,5 +232,3 @@ def test_execute_code_non_approved_still_interrupts_on_stale_bit(monkeypatch):
 
     # Killed on the first poll before the script can print.
     assert "CODE_DONE" not in result["output"], result
-
-

@@ -564,7 +564,10 @@ def _agentbroker_token() -> str:
             raise ValueError("BROKER_TOKEN_FILE must be absolute")
         path = path.resolve(strict=True)
         metadata = path.stat()
-        if not path.is_file() or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+        getuid = getattr(os, "getuid", None)
+        if getuid is None:
+            raise ValueError("BROKER_TOKEN_FILE owner verification is unavailable")
+        if not path.is_file() or metadata.st_uid != getuid() or metadata.st_mode & 0o077:
             raise ValueError("BROKER_TOKEN_FILE must be owner-only")
         if metadata.st_size > 64 * 1024:
             raise ValueError("BROKER_TOKEN_FILE is too large")

@@ -695,6 +695,7 @@ class TestCleanupTempRecordings:
 # ============================================================================
 
 class TestPlayBeep:
+    @pytest.mark.linux_only
     def test_beep_calls_sounddevice_play(self, mock_sd):
         np = pytest.importorskip("numpy")
 

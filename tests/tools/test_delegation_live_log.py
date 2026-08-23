@@ -431,8 +431,9 @@ def test_batch_dispatch_creates_one_log_per_task(monkeypatch):
     monkeypatch.setattr(dt, "_run_single_child", _fake_run)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: _CREDS)
 
+    goals = ("Inspect alpha workflow", "Inspect beta workflow")
     out = json.loads(dt.delegate_task(
-        tasks=[{"goal": "alpha"}, {"goal": "beta"}], parent_agent=parent,
+        tasks=[{"goal": goal} for goal in goals], parent_agent=parent,
     ))
     assert len(out["live_transcripts"]) == 2
     names = [Path(p).name for p in out["live_transcripts"]]
@@ -440,7 +441,7 @@ def test_batch_dispatch_creates_one_log_per_task(monkeypatch):
     # Both under the same delegation dir
     parents = {Path(p).parent for p in out["live_transcripts"]}
     assert len(parents) == 1
-    for p, goal in zip(out["live_transcripts"], ("alpha", "beta")):
+    for p, goal in zip(out["live_transcripts"], goals):
         assert goal in Path(p).read_text(encoding="utf-8")
 
 

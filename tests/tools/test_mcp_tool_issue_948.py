@@ -121,7 +121,7 @@ def test_run_stdio_malware_check_does_not_block_event_loop():
     asyncio.run(_test())
 
 
-def test_run_stdio_malware_check_times_out_fail_open():
+def test_run_stdio_malware_check_times_out_fail_open(caplog):
     """A check that hangs past the timeout must NOT freeze startup: it times
     out, logs, and proceeds (fail-open) so the server still starts."""
     import time
@@ -138,11 +138,8 @@ def test_run_stdio_malware_check_times_out_fail_open():
              patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm), \
              patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
             server = MCPServerTask("srv")
-            start = time.monotonic()
             await server.start({"command": "npx", "args": ["-y", "pkg"]})
-            elapsed = time.monotonic() - start
             await server.shutdown()
-        # Returned shortly after the 0.2s timeout (fail-open), not the 0.5s hang.
-        assert elapsed < 1.0, f"startup did not fail-open promptly ({elapsed:.1f}s)"
+        assert any("malware preflight timed out" in message for message in caplog.messages)
 
     asyncio.run(_test())

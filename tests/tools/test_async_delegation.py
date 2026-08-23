@@ -948,6 +948,17 @@ def test_agentbroker_token_file_rejects_insecure_permissions(tmp_path, monkeypat
     assert ad._agentbroker_token() == ""
 
 
+def test_agentbroker_token_file_fails_closed_without_owner_verification(tmp_path, monkeypatch):
+    monkeypatch.delenv("BROKER_TOKEN", raising=False)
+    token_file = tmp_path / "broker.token"
+    token_file.write_text("x" * 64, encoding="utf-8")
+    token_file.chmod(0o600)
+    monkeypatch.setenv("BROKER_TOKEN_FILE", str(token_file))
+    monkeypatch.delattr(ad.os, "getuid", raising=False)
+
+    assert ad._agentbroker_token() == ""
+
+
 def test_timeout_escalates_once_to_approval_gated_agentbroker_and_refreshes_receipt(
     tmp_path, monkeypatch,
 ):
