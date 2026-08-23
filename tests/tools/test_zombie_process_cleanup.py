@@ -459,6 +459,14 @@ class TestDelegationCleanup:
         relay_runtime._reset_for_tests()
         profile_home = tmp_path / "profile-timeout"
         profile_token = set_hermes_home_override(profile_home)
+        noop_host = relay_runtime.NoopRelayRuntime(
+            str(profile_home), "delegation cleanup test"
+        )
+        monkeypatch.setattr(
+            relay_runtime.HOST_REGISTRY,
+            "for_profile",
+            lambda *_args, **_kwargs: noop_host,
+        )
         child_started = threading.Event()
         release_child = threading.Event()
         child_finished = threading.Event()
