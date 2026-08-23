@@ -1,6 +1,8 @@
 """Persistent slash-command worker — one HermesCLI per TUI session.
 
-Protocol: reads JSON lines from stdin {id, command}, writes {id, ok, output|error} to stdout.
+Protocol: writes {type: "mcp.ready"} when background MCP discovery settles,
+then reads JSON lines from stdin {id, command} and writes
+{id, ok, output|error} to stdout.
 """
 
 # Stop a ``utils/`` (or ``proxy/``, ``ui/``) package in the launch directory
@@ -49,7 +51,27 @@ def _env_float(name: str, default: float) -> float:
 _WATCHDOG_POLL_S = max(0.05, _env_float("HERMES_SLASH_WATCHDOG_POLL_S", 2.0))
 _ORPHAN_GRACE_S = max(0.0, _env_float("HERMES_SLASH_WATCHDOG_GRACE_S", 5.0))
 _in_flight = threading.Event()  # set while a command is executing
+_protocol_stdout = sys.stdout
+_protocol_write_lock = threading.Lock()
 logger = logging.getLogger(__name__)
+
+
+def _write_protocol_frame(payload: dict) -> None:
+    """Write one JSONL protocol frame without interleaving with another thread."""
+    with _protocol_write_lock:
+        _protocol_stdout.write(json.dumps(payload) + "\n")
+        _protocol_stdout.flush()
+
+
+def _announce_mcp_readiness() -> None:
+    """Publish readiness when the shared discovery owner has fully settled."""
+    try:
+        from hermes_cli.mcp_startup import join_mcp_discovery
+
+        if join_mcp_discovery():
+            _write_protocol_frame({"type": "mcp.ready"})
+    except Exception:
+        logger.debug("MCP readiness announcement failed", exc_info=True)
 
 
 def _is_orphaned(original_ppid, getppid=os.getppid) -> bool:
@@ -97,6 +119,20 @@ def _run(cli: HermesCLI, command: str) -> str:
     if not cmd.startswith("/"):
         cmd = f"/{cmd}"
 
+    # The initial interactive discovery join is deliberately short so a dead
+    # MCP server cannot stall every slash command.  /tools is different: it is
+    # the inspection surface users call specifically to verify discovered
+    # tools.  If discovery is still running, wait at this command boundary
+    # using the existing bounded single-query readiness policy.  Other slash
+    # commands keep the fast interactive startup path unchanged.
+    if cmd.split(None, 1)[0].lower() == "/tools":
+        try:
+            from hermes_cli.mcp_startup import wait_for_mcp_discovery
+
+            wait_for_mcp_discovery(single_query=True)
+        except Exception:
+            logger.debug("MCP readiness wait failed for /tools", exc_info=True)
+
     buf = io.StringIO()
 
     # Rich Console captures its file handle at construction time, so
@@ -143,6 +179,14 @@ def main():
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         cli = HermesCLI(model=args.model or None, compact=True, resume=args.session_key, verbose=False)
 
+    # _SlashWorker.run ignores frames whose id does not match its request, so
+    # the readiness event is backward-compatible with the request/response loop.
+    threading.Thread(
+        target=_announce_mcp_readiness,
+        name="slash-worker-mcp-readiness",
+        daemon=True,
+    ).start()
+
     # Spurious stdin-EOF recovery (same O_NONBLOCK shared file-description
     # issue as the gateway entry point — any child inheriting fd 0 can flip
     # the flag and launder EAGAIN into an apparent EOF).
@@ -168,11 +212,9 @@ def main():
             req = json.loads(line)
             rid = req.get("id")
             out = _run(cli, req.get("command", ""))
-            sys.stdout.write(json.dumps({"id": rid, "ok": True, "output": out}) + "\n")
-            sys.stdout.flush()
+            _write_protocol_frame({"id": rid, "ok": True, "output": out})
         except Exception as e:
-            sys.stdout.write(json.dumps({"id": rid, "ok": False, "error": str(e)}) + "\n")
-            sys.stdout.flush()
+            _write_protocol_frame({"id": rid, "ok": False, "error": str(e)})
         finally:
             _in_flight.clear()
             # Workers persist for the TUI session, so release allocator pages at

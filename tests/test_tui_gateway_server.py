@@ -712,17 +712,21 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
 
     seen = []
-    built = threading.Event()
+    discovery_started = threading.Event()
 
     monkeypatch.setattr(
         server,
         "_make_agent",
-        lambda *args, **kwargs: built.set()
-        or type("Agent", (), {"model": "test"})(),
+        lambda *args, **kwargs: type("Agent", (), {"model": "test"})(),
     )
+
+    def _record_discovery_home():
+        seen.append(str(get_hermes_home()))
+        discovery_started.set()
+
     monkeypatch.setattr(
         "tui_gateway.entry.ensure_mcp_discovery_started",
-        lambda: seen.append(str(get_hermes_home())),
+        _record_discovery_home,
     )
     monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
     monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
@@ -734,6 +738,10 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
     monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_probe_config_health", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
 
     ready = threading.Event()
     sid = f"test-sid-{uuid.uuid4().hex[:8]}"
@@ -744,11 +752,18 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     }
 
     server._sessions[sid] = session
+    build_thread = None
     try:
         server._start_agent_build(sid, session)
-        assert built.wait(timeout=15), "agent build thread never called _make_agent"
-        assert ready.wait(timeout=5), "agent_ready never set after build"
+        build_thread = session["_agent_build_thread"]
+        deadline = time.monotonic() + 15
+        assert discovery_started.wait(timeout=15), "agent build never started MCP discovery"
+        build_thread.join(timeout=max(0, deadline - time.monotonic()))
+        assert not build_thread.is_alive(), "agent build thread did not finish"
+        assert ready.is_set(), "agent_ready was not published after build"
     finally:
+        if build_thread is not None and build_thread.is_alive():
+            build_thread.join(timeout=15)
         server._sessions.pop(sid, None)
 
     assert seen == [str(profile_home)]
@@ -796,6 +811,10 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
     monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_probe_config_health", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
 
     ready = threading.Event()
     sid = f"test-secret-sid-{uuid.uuid4().hex[:8]}"
@@ -806,11 +825,18 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     }
 
     server._sessions[sid] = session
+    build_thread = None
     try:
         server._start_agent_build(sid, session)
+        build_thread = session["_agent_build_thread"]
+        deadline = time.monotonic() + 15
         assert built.wait(timeout=15), "agent build thread never called _make_agent"
-        assert ready.wait(timeout=5), "agent_ready never set after build"
+        build_thread.join(timeout=max(0, deadline - time.monotonic()))
+        assert not build_thread.is_alive(), "agent build thread did not finish"
+        assert ready.is_set(), "agent_ready was not published after build"
     finally:
+        if build_thread is not None and build_thread.is_alive():
+            build_thread.join(timeout=15)
         server._sessions.pop(sid, None)
 
     assert scopes == [{"PROXMOX_TOKEN": "grace-secret"}]

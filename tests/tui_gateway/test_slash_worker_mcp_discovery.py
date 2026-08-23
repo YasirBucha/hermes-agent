@@ -92,10 +92,26 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         assert proc.stdin is not None
         assert proc.stdout is not None
         stdout = proc.stdout
+
+        def _read_stdout() -> None:
+            for line in stdout:
+                output.put(line)
+
         threading.Thread(
-            target=lambda: output.put(stdout.readline()),
+            target=_read_stdout,
             daemon=True,
         ).start()
+
+        # Synchronize on actual discovery readiness instead of charging Python
+        # import and MCP startup time to the command's 10s response budget.
+        # The production worker has a 45s command ceiling; keep this readiness
+        # wait bounded by the same outer contract.
+        try:
+            mcp_ready_line = output.get(timeout=45)
+        except queue.Empty:
+            pytest.fail("slash worker produced no MCP readiness frame within 45 seconds")
+        assert json.loads(mcp_ready_line) == {"type": "mcp.ready"}
+
         proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
         proc.stdin.flush()
         try:
@@ -112,3 +128,40 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
+
+
+def test_tools_command_waits_for_mcp_discovery_readiness(monkeypatch):
+    """The first /tools snapshot must happen after pending discovery settles."""
+    from tui_gateway import slash_worker
+
+    ready = threading.Event()
+    order: list[str] = []
+
+    def _wait_for_mcp_discovery(*, single_query=False):
+        assert single_query is True
+        order.append("ready")
+        ready.set()
+
+    class _CLI:
+        console = None
+
+        def process_command(self, command):
+            if command == "/tools":
+                assert ready.is_set(), "/tools ran before MCP discovery readiness"
+            order.append(command)
+            print("mcp__profileprobe__hermes_61922_profile_probe")
+
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup.wait_for_mcp_discovery",
+        _wait_for_mcp_discovery,
+    )
+
+    result = slash_worker._run(_CLI(), "/tools")
+
+    assert order == ["ready", "/tools"]
+    assert "mcp__profileprobe__hermes_61922_profile_probe" in result
+
+    ready.clear()
+    order.clear()
+    slash_worker._run(_CLI(), "/help")
+    assert order == ["/help"], "unrelated commands must not wait for MCP discovery"
