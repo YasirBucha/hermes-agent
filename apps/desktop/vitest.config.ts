@@ -25,7 +25,10 @@ const electronNative: TestProjectConfiguration = {
     name: 'electron',
     environment: 'node',
     maxWorkers: 4,
-    include: ['electron/**/*.test.ts', 'scripts/**.test.{ts,mjs}'],
+    // `e2e/**/*.unit.test.ts` is the e2e HELPERS, not the specs: plain node
+    // modules that should be provable without booting Electron. Playwright
+    // ignores the same pattern so they run in exactly one runner.
+    include: ['electron/**/*.test.ts', 'scripts/**.test.{ts,mjs}', 'e2e/**/*.unit.test.ts'],
     exclude: ['scripts/run-short-session-hang-repro.test.mjs']
   }
 }
