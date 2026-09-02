@@ -13,8 +13,8 @@ name: Install & Update E2E
 # ships, and would pin an "oldest" that nobody still runs.
 #
 # Triggers:
-#   * every 12 hours, so upstream drift (a new uv, a Node bump, a PyPI change)
-#     surfaces on a schedule rather than in someone's review cycle;
+#   * weekly, testing the newest release through the normal update route so
+#     upstream drift still surfaces without running the full matrix daily;
 #   * when a release tag is created -- the moment the set of versions users can
 #     update FROM changes, and the moment a broken updater would strand them;
 #   * manually, where you can pick the route and how many releases to sample.
@@ -38,8 +38,8 @@ on:
         type: string
         default: '5'
   schedule:
-    # Every 12 hours, off the hour to avoid the top-of-hour runner crunch.
-    - cron: '20 7,19 * * *'
+    # Weekly Monday, off the hour to avoid the top-of-hour runner crunch.
+    - cron: '20 7 * * 1'
   push:
     tags:
       # Release tags only: the repo also carries backup/* and one-off tags.
@@ -75,7 +75,9 @@ jobs:
       - id: pick
         run: |
           set -euo pipefail
-          tags="$(scripts/sandbox/pick-release-tags.sh --count '${{ inputs.tag-count || 5 }}')"
+          count='${{ inputs.tag-count || 5 }}'
+          if [ '${{ github.event_name }}' = schedule ]; then count=1; fi
+          tags="$(scripts/sandbox/pick-release-tags.sh --count "$count")"
           echo "Testing updates from: $tags"
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
@@ -97,7 +99,7 @@ jobs:
   # Re-running the curl one-liner over an existing checkout: autostash + pull
   # rather than the updater's own git handling.
   installer:
-    if: github.event_name != 'workflow_dispatch' || inputs.route != 'update'
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.route != 'update')
     needs: pick-releases
     strategy:
       fail-fast: false
