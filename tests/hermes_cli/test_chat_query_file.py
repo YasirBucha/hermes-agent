@@ -39,13 +39,29 @@ def test_query_file_reads_hostile_text_verbatim(tmp_path, monkeypatch):
     f = tmp_path / "dm.txt"
     f.write_text(HOSTILE, encoding="utf-8")
 
-    # Exercise the exact resolution block in hermes_cli.main by simulating it:
-    # the block reads the file into args.query before dispatch.
-    args = _parse(["chat", "--query-file", str(f)])
-    assert args.query_file is not None
-    body = Path(args.query_file).read_text(encoding="utf-8")
-    assert body == HOSTILE
-    assert "$(touch" in body  # preserved, not executed
+    # Exercise the real file-resolution and dispatch path. Only the model
+    # entry point and unrelated startup work are replaced; no real session
+    # or provider receives the synthetic artifact.
+    import types
+    import hermes_cli.main as main_mod
+
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(main_mod, "_has_any_provider_configured", lambda: True)
+    monkeypatch.setattr(main_mod, "_pin_kanban_board_env", lambda: None)
+    monkeypatch.setattr(main_mod, "_sync_bundled_skills_for_startup", lambda: None)
+    monkeypatch.setattr(main_mod, "_termux_should_prefetch_update_check", lambda: False)
+    captured = {}
+    fake_cli = types.ModuleType("cli")
+    fake_cli.main = lambda **kwargs: captured.update(kwargs)
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    args = _parse(["chat", "--cli", "--query-file", str(f)])
+    main_mod.cmd_chat(args)
+    assert captured["query"] == HOSTILE
+    assert f.read_text(encoding="utf-8") == HOSTILE
+    assert not args.yolo
     assert not Path("/tmp/pwned_by_dm_test").exists()
 
 
