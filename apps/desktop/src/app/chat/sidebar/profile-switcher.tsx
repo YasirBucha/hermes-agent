@@ -284,9 +284,17 @@ export function ProfileRail() {
   // Tick a haptic each time the drag crosses into a new cell, and a satisfying
   // confirm on a committed reorder.
   const lastOverRef = useRef<string | null>(null)
+  const [draggingProfileId, setDraggingProfileId] = useState<null | string>(null)
 
   const handleDragStart = ({ active }: DragStartEvent) => {
-    lastOverRef.current = String(active.id)
+    const id = String(active.id)
+    lastOverRef.current = id
+    setDraggingProfileId(id)
+  }
+
+  const handleDragCancel = () => {
+    lastOverRef.current = null
+    setDraggingProfileId(null)
   }
 
   const handleDragOver = ({ over }: DragOverEvent) => {
@@ -300,6 +308,7 @@ export function ProfileRail() {
 
   const handleDragEnd = ({ active, over }: DragEndEvent) => {
     lastOverRef.current = null
+    setDraggingProfileId(null)
 
     if (!over || active.id === over.id) {
       return
@@ -356,6 +365,7 @@ export function ProfileRail() {
         <DndContext
           collisionDetection={closestCenter}
           modifiers={[stepThroughCells]}
+          onDragCancel={handleDragCancel}
           onDragEnd={handleDragEnd}
           onDragOver={handleDragOver}
           onDragStart={handleDragStart}
@@ -364,7 +374,16 @@ export function ProfileRail() {
           <SortableContext items={named.map(profile => profile.name)} strategy={horizontalListSortingStrategy}>
             {/* relative → the strip is the dragged square's offsetParent, so the
               clamp modifier bounds drags to the occupied cells (not the +). */}
-            <div className="relative flex items-center gap-1">
+            <div
+              className={cn(
+                'relative flex items-center gap-1 rounded-[10px] border-[1.5px] border-solid transition-[border-color,background-color,box-shadow] duration-[180ms] ease-[cubic-bezier(0.22,1,0.36,1)]',
+                draggingProfileId !== null
+                  ? 'border-primary bg-primary/[0.08] shadow-[0_6px_12px_0.5px_rgba(99,102,241,0.22)]'
+                  : 'border-transparent'
+              )}
+              data-bounded-reorder-active={draggingProfileId !== null ? 'true' : 'false'}
+              data-bounded-reorder-container="profile-switcher-rail"
+            >
               {named.map(profile => (
                 <ProfileSquare
                   active={!isAll && normalizeProfileKey(profile.name) === activeKey}
@@ -1201,7 +1220,7 @@ function ProfileSquare({
   useEffect(() => clearPress, [])
 
   const base = CSS.Transform.toString(transform)
-  const ring = active ? `inset 0 0 0 1.5px ${hue}` : ''
+  const ring = isDragging ? 'inset 0 0 0 1.5px var(--primary)' : active ? `inset 0 0 0 1.5px ${hue}` : ''
   const lift = isDragging ? '0 6px 16px -4px rgb(0 0 0 / 0.4)' : ''
 
   const pickColor = (next: null | string) => {
@@ -1220,18 +1239,16 @@ function ProfileSquare({
                 <TooltipTrigger asChild>
                   <button
                     className={cn(
-                      'relative grid size-5 shrink-0 cursor-grab touch-none select-none place-items-center rounded-[3px] text-[0.5625rem] font-semibold uppercase leading-none transition-opacity hover:opacity-100',
+                      'relative grid size-5 shrink-0 cursor-grab touch-none select-none place-items-center text-[0.5625rem] font-semibold uppercase leading-none transition-opacity hover:opacity-100',
                       active ? 'opacity-100' : 'opacity-55',
-                      isDragging && 'z-10 cursor-grabbing opacity-100'
+                      isDragging ? 'z-10 cursor-grabbing rounded-[8px] opacity-100' : 'rounded-[3px]'
                     )}
                     ref={setNodeRef}
                     style={{
-                      backgroundColor: profileColorSoft(hue, active ? 30 : 22),
+                      backgroundColor: profileColorSoft(hue, active || isDragging ? 30 : 22),
                       boxShadow: [ring, lift].filter(Boolean).join(', ') || undefined,
                       color: color ?? undefined,
-                      // Glide the dragged square between snapped cells with a little
-                      // overshoot (no scale — the overflow-x strip would clip it).
-                      transform: base,
+                      transform: isDragging ? `${base || 'translate3d(0px, 0px, 0)'} scale(1.018)` : base,
                       transition: isDragging ? DRAG_TRANSITION : transition
                     }}
                     type="button"

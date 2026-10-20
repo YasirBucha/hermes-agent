@@ -103,7 +103,7 @@ import {
 
 // ── optimistic board edits (reconciled by the follow-up refresh) ─────────────
 
-function moveCard(board: KanbanBoard, id: string, toStatus: string): KanbanBoard {
+function moveCard(board: KanbanBoard, id: string, toStatus: string, beforeTaskId?: string): KanbanBoard {
   let moved: KanbanTask | undefined
 
   const columns = board.columns.map(col => ({
@@ -125,7 +125,24 @@ function moveCard(board: KanbanBoard, id: string, toStatus: string): KanbanBoard
 
   return {
     ...board,
-    columns: columns.map(col => (col.name === toStatus ? { ...col, tasks: [moved!, ...col.tasks] } : col))
+    columns: columns.map(col => {
+      if (col.name !== toStatus) {
+        return col
+      }
+
+      if (beforeTaskId && beforeTaskId !== id) {
+        const targetIndex = col.tasks.findIndex(task => task.id === beforeTaskId)
+
+        if (targetIndex >= 0) {
+          const nextTasks = [...col.tasks]
+          nextTasks.splice(targetIndex, 0, moved!)
+
+          return { ...col, tasks: nextTasks }
+        }
+      }
+
+      return { ...col, tasks: [moved!, ...col.tasks] }
+    })
   }
 }
 
@@ -239,6 +256,11 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
 
 function Card({
   columns,
+  isDropTarget = false,
+  onCardDragEnd,
+  onCardDragOver,
+  onCardDragStart,
+  onCardDrop,
   onDelete,
   onMove,
   onOpen,
@@ -247,6 +269,11 @@ function Card({
   task
 }: {
   columns: string[]
+  isDropTarget?: boolean
+  onCardDragEnd?: () => void
+  onCardDragOver?: (id: string) => void
+  onCardDragStart?: (id: string) => void
+  onCardDrop?: (id: string) => void
   onDelete: (id: string) => void
   onMove: (id: string, status: string) => void
   onOpen: (id: string) => void
@@ -269,13 +296,22 @@ function Card({
             'group relative flex cursor-grab flex-col gap-2 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) p-2.5',
             // Hover matches the provider-picker rows: a quiet primary fill;
             // selected = the theme's focus color (same as a focused input).
-            'transition-colors hover:bg-primary/[0.06] active:cursor-grabbing',
+            'transition-[transform,background-color,border-color,box-shadow] duration-[180ms] ease-[cubic-bezier(0.22,1,0.36,1)] hover:bg-primary/[0.06] active:cursor-grabbing',
             selected && 'border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]',
-            dragging && 'opacity-40'
+            dragging &&
+              'z-10 scale-[1.018] rounded-[8px] border-[1.5px] border-primary bg-primary/[0.08] opacity-90 shadow-[0_8px_18px_-4px_rgba(15,23,42,0.28)]',
+            isDropTarget && !dragging && 'translate-y-1 ring-[1.5px] ring-primary/60'
           )}
           draggable
           onClick={event => (event.metaKey || event.ctrlKey ? onToggleSelect(task.id) : onOpen(task.id))}
-          onDragEnd={() => setDragging(false)}
+          onDragEnd={() => {
+            setDragging(false)
+            onCardDragEnd?.()
+          }}
+          onDragOver={event => {
+            event.preventDefault()
+            onCardDragOver?.(task.id)
+          }}
           onDragStart={event => {
             event.dataTransfer.setData('text/plain', task.id)
             event.dataTransfer.effectAllowed = 'move'
@@ -283,6 +319,16 @@ function Card({
             // stays a solid card (dimming first would bake 40% into it).
             event.dataTransfer.setDragImage(event.currentTarget, event.nativeEvent.offsetX, event.nativeEvent.offsetY)
             setDragging(true)
+            onCardDragStart?.(task.id)
+          }}
+          onDrop={event => {
+            event.preventDefault()
+            event.stopPropagation()
+            const sourceId = event.dataTransfer.getData('text/plain')
+
+            if (sourceId) {
+              onCardDrop?.(sourceId)
+            }
           }}
           style={{ '--kanban-tone': meta.tone, borderLeftColor: meta.tone } as CSSProperties}
         >
@@ -351,7 +397,7 @@ function Column({
   columns: string[]
   onAdd: (status: string) => void
   onDelete: (id: string) => void
-  onDropTask: (id: string, status: string) => void
+  onDropTask: (id: string, status: string, beforeTaskId?: string) => void
   onMove: (id: string, status: string) => void
   onOpen: (id: string) => void
   onToggle: () => void
@@ -360,6 +406,8 @@ function Column({
 }) {
   const k = useKanban()
   const [over, setOver] = useState(false)
+  const [draggingTaskId, setDraggingTaskId] = useState<null | string>(null)
+  const [hoverTaskId, setHoverTaskId] = useState<null | string>(null)
   const meta = columnMeta(column.name)
   const label = columnLabel(k, column.name)
   const locked = isLockedTarget(column.name)
@@ -383,7 +431,12 @@ function Column({
   }, [byProfile, column])
 
   const dragHandlers = {
-    onDragLeave: () => setOver(false),
+    onDragLeave: (event: ReactDragEvent<HTMLElement>) => {
+      if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+        setOver(false)
+        setHoverTaskId(null)
+      }
+    },
     onDragOver: (event: ReactDragEvent<HTMLElement>) => {
       // Locked lanes don't preventDefault → the OS shows the no-drop cursor
       // and the drop event never fires. The lane is honest about itself.
@@ -400,6 +453,8 @@ function Column({
     onDrop: (event: ReactDragEvent<HTMLElement>) => {
       event.preventDefault()
       setOver(false)
+      setDraggingTaskId(null)
+      setHoverTaskId(null)
       const id = event.dataTransfer.getData('text/plain')
 
       if (id) {
@@ -408,7 +463,8 @@ function Column({
     }
   }
 
-  const wash = over && !locked ? 'bg-(--ui-bg-quinary)' : 'bg-[color-mix(in_srgb,var(--ui-bg-quinary)_50%,transparent)]'
+  const isFramed = !locked && (over || draggingTaskId !== null)
+  const wash = isFramed ? 'bg-primary/[0.06] dark:bg-primary/[0.09]' : 'bg-[color-mix(in_srgb,var(--ui-bg-quinary)_50%,transparent)]'
 
   // Collapsed = a thin vertical rail: dot, sideways label, count. Still a live
   // drop target (drop straight onto the rail); click expands. The dot sits in
@@ -420,9 +476,14 @@ function Column({
         {...dragHandlers}
         aria-label={k.expand(label)}
         className={cn(
-          'flex h-full w-8 shrink-0 flex-col items-center gap-1.5 rounded-lg p-2 transition-colors hover:bg-(--ui-bg-quinary)',
+          'flex h-full w-8 shrink-0 flex-col items-center gap-1.5 rounded-[10px] border-[1.5px] border-solid p-2 transition-[border-color,background-color,box-shadow] duration-[180ms] ease-[cubic-bezier(0.22,1,0.36,1)] hover:bg-(--ui-bg-quinary)',
+          isFramed
+            ? 'border-primary shadow-[0_6px_12px_0.5px_rgba(99,102,241,0.18)]'
+            : 'border-transparent',
           wash
         )}
+        data-bounded-reorder-active={isFramed ? 'true' : 'false'}
+        data-bounded-reorder-container={`kanban-column-${column.name}`}
         onClick={onToggle}
         type="button"
       >
@@ -439,10 +500,50 @@ function Column({
     )
   }
 
+  const renderCard = (task: KanbanTask) => (
+    <Card
+      columns={columns}
+      isDropTarget={hoverTaskId === task.id && draggingTaskId !== task.id}
+      key={task.id}
+      onCardDragEnd={() => {
+        setDraggingTaskId(null)
+        setHoverTaskId(null)
+        setOver(false)
+      }}
+      onCardDragOver={targetId => {
+        if (!locked) {
+          setOver(true)
+          setHoverTaskId(targetId)
+        }
+      }}
+      onCardDragStart={id => setDraggingTaskId(id)}
+      onCardDrop={sourceId => {
+        setOver(false)
+        setDraggingTaskId(null)
+        setHoverTaskId(null)
+        onDropTask(sourceId, column.name, task.id)
+      }}
+      onDelete={onDelete}
+      onMove={onMove}
+      onOpen={onOpen}
+      onToggleSelect={onToggleSelect}
+      selected={selected.has(task.id)}
+      task={task}
+    />
+  )
+
   return (
     <div
       {...dragHandlers}
-      className={cn('group/col flex h-full w-64 shrink-0 flex-col rounded-lg p-2 transition-colors', wash)}
+      className={cn(
+        'group/col flex h-full w-64 shrink-0 flex-col rounded-[10px] border-[1.5px] border-solid p-2 transition-[border-color,background-color,box-shadow] duration-[180ms] ease-[cubic-bezier(0.22,1,0.36,1)]',
+        isFramed
+          ? 'border-primary shadow-[0_6px_12px_0.5px_rgba(99,102,241,0.18)]'
+          : 'border-transparent',
+        wash
+      )}
+      data-bounded-reorder-active={isFramed ? 'true' : 'false'}
+      data-bounded-reorder-container={`kanban-column-${column.name}`}
     >
       <header className="mb-1.5 flex h-5 items-center gap-1.5 px-1">
         <span className="size-1.5 rounded-full" style={{ backgroundColor: meta.tone }} />
@@ -470,32 +571,10 @@ function Column({
                   {assignee}
                   <span className="tabular-nums">{tasks.length}</span>
                 </div>
-                {tasks.map(task => (
-                  <Card
-                    columns={columns}
-                    key={task.id}
-                    onDelete={onDelete}
-                    onMove={onMove}
-                    onOpen={onOpen}
-                    onToggleSelect={onToggleSelect}
-                    selected={selected.has(task.id)}
-                    task={task}
-                  />
-                ))}
+                {tasks.map(renderCard)}
               </div>
             ))
-          : column.tasks.map(task => (
-              <Card
-                columns={columns}
-                key={task.id}
-                onDelete={onDelete}
-                onMove={onMove}
-                onOpen={onOpen}
-                onToggleSelect={onToggleSelect}
-                selected={selected.has(task.id)}
-                task={task}
-              />
-            ))}
+          : column.tasks.map(renderCard)}
         {/* Jira-style lane add — dashed, faded in on lane hover. Opacity (not
             display) so it always holds its slot and never thrashes layout.
             Locked lanes get none: you can't create into a system state. */}
@@ -1186,13 +1265,13 @@ export function KanbanBoardPage() {
   const total = filtered?.columns.reduce((sum, col) => sum + col.tasks.length, 0) ?? 0
 
   const moveMut = useMutation({
-    mutationFn: ({ id, status }: { id: string; status: string }) => patchTask(id, { status }),
-    onMutate: async ({ id, status }) => {
+    mutationFn: ({ id, status }: { beforeTaskId?: string; id: string; status: string }) => patchTask(id, { status }),
+    onMutate: async ({ beforeTaskId, id, status }) => {
       await qc.cancelQueries({ queryKey: boardKey(slug, archived) })
       const previous = qc.getQueryData<KanbanBoard>(boardKey(slug, archived))
 
       if (previous) {
-        qc.setQueryData(boardKey(slug, archived), moveCard(previous, id, status))
+        qc.setQueryData(boardKey(slug, archived), moveCard(previous, id, status, beforeTaskId))
       }
 
       return { previous }
@@ -1232,10 +1311,10 @@ export function KanbanBoardPage() {
     onSettled: () => void qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
   })
 
-  const onMove = (id: string, status: string) => {
+  const onMove = (id: string, status: string, beforeTaskId?: string) => {
     const task = board?.columns.flatMap(col => col.tasks).find(candidate => candidate.id === id)
 
-    if (!task || task.status === status) {
+    if (!task) {
       return
     }
 
@@ -1245,7 +1324,17 @@ export function KanbanBoardPage() {
       return
     }
 
-    moveMut.mutate({ id, status })
+    if (task.status === status) {
+      if (beforeTaskId && beforeTaskId !== id) {
+        qc.setQueryData<KanbanBoard>(boardKey(slug, archived), previous =>
+          previous ? moveCard(previous, id, status, beforeTaskId) : previous
+        )
+      }
+
+      return
+    }
+
+    moveMut.mutate({ beforeTaskId, id, status })
   }
 
   const errorMessage = error ? errText(error) : null

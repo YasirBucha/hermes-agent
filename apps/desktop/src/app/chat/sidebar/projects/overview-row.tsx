@@ -124,7 +124,10 @@ export function ProjectOverviewRow({
           )}
         </>
       }
-      className={cn(dragging && 'cursor-grabbing bg-(--ui-sidebar-surface-background)')}
+      className={cn(
+        dragging &&
+          'cursor-grabbing rounded-[8px] bg-(--ui-sidebar-surface-background) ring-[1.5px] ring-primary shadow-[0_8px_18px_-4px_rgba(15,23,42,0.28)]'
+      )}
       data-glass-opaque={dragging ? '' : undefined}
       label={
         <SidebarRowLink

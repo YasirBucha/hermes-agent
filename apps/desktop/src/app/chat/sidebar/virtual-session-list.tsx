@@ -224,8 +224,18 @@ interface VirtualSortableRowProps {
   session: SessionInfo
 }
 
+const VIRTUAL_SORTABLE_TRANSITION = {
+  duration: 180,
+  easing: 'cubic-bezier(0.22, 1, 0.36, 1)'
+}
+
 function VirtualSortableRow({ rowProps, session }: VirtualSortableRowProps) {
-  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({ id: session.id })
+  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({
+    id: session.id,
+    transition: VIRTUAL_SORTABLE_TRANSITION
+  })
+
+  const baseTransform = CSS.Transform.toString(transform)
 
   return (
     <SidebarSessionRow
@@ -235,7 +245,10 @@ function VirtualSortableRow({ rowProps, session }: VirtualSortableRowProps) {
       ref={setNodeRef}
       reorderable
       session={session}
-      style={{ transform: CSS.Transform.toString(transform), transition }}
+      style={{
+        transform: isDragging ? `${baseTransform || 'translate3d(0px, 0px, 0)'} scale(1.018)` : baseTransform,
+        transition
+      }}
     />
   )
 }

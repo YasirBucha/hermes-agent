@@ -443,6 +443,37 @@ export function startPaneDrag(
   let mode: 'reorder' | 'zone' | null = null
   let dimmed: HTMLElement[] = []
 
+  const clearReorderStrip = () => {
+    if (!reorder) {
+      return
+    }
+
+    reorder.strip.dataset.boundedReorderActive = 'false'
+    reorder.strip.style.removeProperty('border-radius')
+    reorder.strip.style.removeProperty('box-shadow')
+    reorder.strip.style.removeProperty('background-color')
+    reorder.strip.style.removeProperty('transition')
+  }
+
+  const markReorderStrip = () => {
+    if (!reorder) {
+      return
+    }
+
+    reorder.strip.dataset.boundedReorderContainer = 'pane-tab-strip'
+    reorder.strip.dataset.boundedReorderActive = 'true'
+    reorder.strip.style.setProperty('border-radius', '10px')
+    reorder.strip.style.setProperty(
+      'transition',
+      'box-shadow 180ms cubic-bezier(0.22, 1, 0.36, 1), background-color 180ms cubic-bezier(0.22, 1, 0.36, 1)'
+    )
+    reorder.strip.style.setProperty(
+      'box-shadow',
+      'inset 0 0 0 1.5px var(--primary), 0 6px 12px 0.5px rgba(99, 102, 241, 0.18)'
+    )
+    reorder.strip.style.setProperty('background-color', 'color-mix(in srgb, var(--primary) 7%, transparent)')
+  }
+
   const markSource = () => {
     // Every dragged tab dims for the drag's life — the divider says where they
     // GO, the dim says what MOVES. No live shuffle (placement-on-release).
@@ -454,11 +485,25 @@ export function startPaneDrag(
 
     for (const el of dimmed) {
       el.style.setProperty('opacity', '0.45')
+
+      if (mode === 'reorder') {
+        el.style.setProperty('border-radius', '8px')
+        el.style.setProperty('transform', 'scale(1.018)')
+        el.style.setProperty(
+          'box-shadow',
+          'inset 0 0 0 1.5px var(--primary), 0 6px 14px -4px rgba(15, 23, 42, 0.28)'
+        )
+        el.style.setProperty(
+          'transition',
+          'transform 180ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 180ms cubic-bezier(0.22, 1, 0.36, 1)'
+        )
+      }
     }
   }
 
   const enterZoneMode = () => {
     mode = 'zone'
+    clearReorderStrip()
     // The layout never restructures mid-drag, so zone/strip rects are stable.
     zones = snapshotZones()
     strips = snapshotStrips()
@@ -492,6 +537,7 @@ export function startPaneDrag(
     onEngage(x, y) {
       if (reorder && withinStrip(x, y)) {
         mode = 'reorder'
+        markReorderStrip()
         markSource()
       } else {
         enterZoneMode()
@@ -598,8 +644,14 @@ export function startPaneDrag(
     },
 
     onEnd() {
+      clearReorderStrip()
+
       for (const el of dimmed) {
         el.style.removeProperty('opacity')
+        el.style.removeProperty('border-radius')
+        el.style.removeProperty('transform')
+        el.style.removeProperty('box-shadow')
+        el.style.removeProperty('transition')
       }
 
       highlighted.reset()
