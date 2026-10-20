@@ -464,7 +464,9 @@ function Column({
   }
 
   const isFramed = !locked && (over || draggingTaskId !== null)
-  const wash = isFramed ? 'bg-primary/[0.06] dark:bg-primary/[0.09]' : 'bg-[color-mix(in_srgb,var(--ui-bg-quinary)_50%,transparent)]'
+  const wash = isFramed
+    ? 'bg-primary/[0.06] dark:bg-primary/[0.09]'
+    : 'bg-[color-mix(in_srgb,var(--ui-bg-quinary)_50%,transparent)]'
 
   // Collapsed = a thin vertical rail: dot, sideways label, count. Still a live
   // drop target (drop straight onto the rail); click expands. The dot sits in
@@ -477,9 +479,7 @@ function Column({
         aria-label={k.expand(label)}
         className={cn(
           'flex h-full w-8 shrink-0 flex-col items-center gap-1.5 rounded-[10px] border-[1.5px] border-solid p-2 transition-[border-color,background-color,box-shadow] duration-[180ms] ease-[cubic-bezier(0.22,1,0.36,1)] hover:bg-(--ui-bg-quinary)',
-          isFramed
-            ? 'border-primary shadow-[0_6px_12px_0.5px_rgba(99,102,241,0.18)]'
-            : 'border-transparent',
+          isFramed ? 'border-primary shadow-[0_6px_12px_0.5px_rgba(99,102,241,0.18)]' : 'border-transparent',
           wash
         )}
         data-bounded-reorder-active={isFramed ? 'true' : 'false'}
@@ -537,9 +537,7 @@ function Column({
       {...dragHandlers}
       className={cn(
         'group/col flex h-full w-64 shrink-0 flex-col rounded-[10px] border-[1.5px] border-solid p-2 transition-[border-color,background-color,box-shadow] duration-[180ms] ease-[cubic-bezier(0.22,1,0.36,1)]',
-        isFramed
-          ? 'border-primary shadow-[0_6px_12px_0.5px_rgba(99,102,241,0.18)]'
-          : 'border-transparent',
+        isFramed ? 'border-primary shadow-[0_6px_12px_0.5px_rgba(99,102,241,0.18)]' : 'border-transparent',
         wash
       )}
       data-bounded-reorder-active={isFramed ? 'true' : 'false'}

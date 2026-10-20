@@ -109,9 +109,7 @@ export function useSortableBindings(id: string) {
     reorderable: true as const,
     style: {
       // Uniform vertical list: translate on Y and apply a subtle 1.018 lift scale when dragging.
-      transform: isDragging
-        ? `${translateY ?? 'translate3d(0px, 0px, 0)'} scale(1.018)`
-        : translateY,
+      transform: isDragging ? `${translateY ?? 'translate3d(0px, 0px, 0)'} scale(1.018)` : translateY,
       transition: isDragging ? undefined : transition,
       willChange: isDragging ? 'transform' : undefined
     }

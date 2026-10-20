@@ -489,10 +489,7 @@ export function startPaneDrag(
       if (mode === 'reorder') {
         el.style.setProperty('border-radius', '8px')
         el.style.setProperty('transform', 'scale(1.018)')
-        el.style.setProperty(
-          'box-shadow',
-          'inset 0 0 0 1.5px var(--primary), 0 6px 14px -4px rgba(15, 23, 42, 0.28)'
-        )
+        el.style.setProperty('box-shadow', 'inset 0 0 0 1.5px var(--primary), 0 6px 14px -4px rgba(15, 23, 42, 0.28)')
         el.style.setProperty(
           'transition',
           'transform 180ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 180ms cubic-bezier(0.22, 1, 0.36, 1)'
