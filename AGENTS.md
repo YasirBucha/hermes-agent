@@ -1813,3 +1813,17 @@ Whenever Yasir asks to draft, write, or prepare an email in **any** project or I
    - **Greeting**: Always open with the recipient's **first name + comma** in bold (e.g., `<p style="margin: 0.0px 0.0px 13.2px 0.0px; ..."><b>Fahad,</b></p>`) — **NEVER** write `"Dear ..."`, `"Hi ..."`, or `"Good day"`.
    - **Paragraphs & Nested Lists for `ComposeNativeTextEditor.swift`**: Use `<p style="margin: 0.0px 0.0px 13.2px 0.0px; font-size: 13.2px; font-family: Nunito, 'Trebuchet MS', Verdana, Helvetica, sans-serif; color: #000000; line-height: 1.35;">` (without `data-aimailx-compose-line="true"`, which `prepareHtmlForComposeEditor` strips to unstyled `<p>`) and real `<ol>` numbered items with nested `<ul>` sub-bullets (`<ol><li><b>Numbered Heading</b><ul><li>Indented sub-bullet...</li></ul></li></ol>`) so AppKit's `NSTextView` indents sub-bullets at Level 2 (`firstLineHeadIndent = 36pt`, `headIndent = 72pt`).
 3. **First-Person Singular Voice, Plain-English Scenarios & Verified Recipients**: Always write in Yasir's first-person singular voice (`"I"`, `"my"`, `"me"` — never `"we"`, `"our"`, `"us"`), explain real-world scenarios and corrective plans in plain, simple English rather than raw database column jargon, and disambiguate recipients via `pim_data.db` / BIH-Dashboard designations before saving.
+
+
+## Compact Dashboard Connected Apps (Owner, 21 October 2026)
+
+For NovoBiz dashboards, place cross-app shortcuts in one compact **Connected Apps** button in the existing dashboard header. Open the full shortcut list only on demand; do not reserve a standalone always-visible bar for these secondary links. Preserve all six existing destinations, selected company/brand scope, permission checks, and contextual record links. Verify the menu on mobile and desktop. This is a dashboard presentation preference, not authorization to change destination contracts or unrelated workflows. Every IDE must preserve and synchronize future owner design guidelines across the shared IDE rules and connected app instructions.
+
+
+## Brief Email Disclosure (Owner, 21 October 2026)
+
+In AI MailX, opening Brief shows the Brief alone. Reveal the selected conversation below it only after **View Thread Below** is clicked; selecting a card or subject must not reveal it. Reopening Brief resets the revealed conversation, and closing Brief restores normal reading. Viewing a Brief or its conversation must not itself mark mail read. Apply the same behavior on mobile and desktop. This is a presentation rule, not permission to change shared data contracts. Every IDE must preserve and synchronize future owner design guidelines across shared IDE rules and connected app instructions.
+
+## FloatMic iPhone Live Dictation At The Cursor (Owner, 21 October 2026)
+
+For the FloatMic iPhone keyboard, Speak should display live dictated text at the active text-field cursor rather than inside the keyboard. Keep this scope specific to iPhone FloatMic; preserve surrounding user text and the existing final-transcription/history behavior. Shared computer/phone testing must wait for all earlier coordinator queue tasks and a fresh grant. Every IDE must preserve and synchronize future owner design guidelines across shared IDE rules and connected app instructions.

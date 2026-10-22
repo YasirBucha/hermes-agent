@@ -35,6 +35,15 @@
       ],
       "transport": "contract-only",
       "status": "implemented"
+    },
+    "healthcarePanelAgreements": {
+      "sourceOfTruth": "NovoBiz",
+      "readEndpoint": "/api/integrations/novobiz/panels",
+      "companyScoped": true,
+      "access": "BrainCore app authentication plus X-NovoBiz-User-Token; NovoBiz company-direct finance, leadership or read-only Auditor role required; audit access never permits changes or approvals",
+      "mode": "read_only",
+      "semantics": "Verified source capture is separate from signed execution, current applicability and approved billing rates. No editable replicas or HIS tariff writes.",
+      "role": "reader"
     }
   }
 }
