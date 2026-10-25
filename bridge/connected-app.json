@@ -44,6 +44,16 @@
       "mode": "read_only",
       "semantics": "Verified source capture is separate from signed execution, current applicability and approved billing rates. No editable replicas or HIS tariff writes.",
       "role": "reader"
+    },
+    "healthcareClaims": {
+      "sourceOfTruth": "NovoBiz",
+      "readEndpoint": "/api/integrations/novobiz/claims",
+      "companyScoped": true,
+      "mode": "read_only",
+      "access": "BrainCore app authentication plus X-NovoBiz-User-Token; company-direct Finance, leadership or Auditor in NovoBiz. No grants are added.",
+      "money": "Integer minor currency units; bank cash, withholding tax, approved deductions and disputed balances remain separate.",
+      "semantics": "Saved operational claims; staff queues, frozen panel rules, preserved rejection/submission history and independently reviewed accounting handoffs. No ledger posting, HIS writes or automatic insurer filing. Live pilot on hold. New claim actions require matching evidence types and separate tax evidence for withholding. Reconciliation excludes every payment and adjustment contributor, including reversals. Receipt/acceptance acknowledgements retain the original submission date/reference after resubmission. Existing records are not migrated; optional taxEvidenceId and acknowledgement submissionDate/submissionReference are additive.",
+      "status": "implementation_verified_pilot_on_hold"
     }
   }
 }
