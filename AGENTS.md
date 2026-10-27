@@ -1919,3 +1919,15 @@ Preserve the existing BIH, NovoBiz and ControlX app shells, headers, navigation 
 ## Mandatory Ecosystem-Wide English-Only Transcription, Translation & Output Rule (Owner Directive — 25 October 2026)
 
 Never transcribe, translate, summarize, or output in Urdu (`ur`), Hindi (`hi`), Arabic script, Devanagari script, or Roman Urdu. Always produce and display all transcripts, turn translations, summaries, action items, titles, keywords, executive minutes, email drafts, AI MailX calendar notes, BrainCore live context packets, GTD tasks, ControlX extractions, and MyDataX packets in plain English (`en`), even when spoken audio or source input is in Urdu, Hindi, Roman Urdu, or mixed speech. Every STT engine, local/cloud LLM prompt, translation pipeline, and cross-app bridge across the connected ecosystem (`Notely`, `FloatMic`, `AiMailx`, `BrainCore`, `GTD`, `ControlX`, `MyDataX`, `NovoBiz`, `BIH-Dashboard`, `Tony`, `Hermes`, `AgentBroker`, `OpenClaw`, `OpenIntelligentUI`) must enforce `en` output and block/remove `ur` and `hi` output modes.
+
+
+## GTD Approved Monogram Icon (Owner, 26 October 2026)
+
+GTD uses the approved GTD Monogram: a blue G with white inner space and a yellow checkmark on charcoal. Use the canonical `GTD/public/gtd-app-icon.png` to generate every GTD launcher icon, favicon, splash/login/profile fallback and invitation logo across web, macOS, iPhone/iPad and Android. Keep GTD representations in connected apps consistent when present; do not replace other apps’ own identities. Preserve platform masks, legibility, framed logos, and app data during updates. Every IDE must preserve and synchronize future owner design guidelines across shared IDE rules and connected-app instructions.
+
+## Persistent Desktop Window Size And Position (Owner, 27 October 2026)
+
+Every macOS and desktop app across the ecosystem (`BanX`, `GTD`, `AiMailx`, `Notely`, `BIH-Dashboard`, `NovoBiz`, `ControlX`, `MyDataX`, `Tony`, `PubX`, `Runway`, `ClipBoardX`, `FloatMic`, and all future desktop apps) must remember and restore the user's last resized window dimensions and screen position across app launches:
+- **Automatic Save on Resize, Move, and Close**: Persist the main window's width, height, and screen coordinates whenever the user resizes, moves, or closes the window (`UserDefaults` + explicit `NSWindow` frame observer on SwiftUI/AppKit, `setFrameUsingName` / `setFrameAutosaveName` on Flutter macOS, `window-state.json` on Tauri and Electron).
+- **Guard Against Launch-Screen Shrink & ASLR Autosave Drift**: Never allow launch screens (`ZStack` splash overlays), `.onOpenURL` `SceneBridgeReader` wrapper type changes, or initial layout passes to overwrite the saved window frame or shrink the window into a narrow/mobile strip on desktop. Enforce sensible desktop minimum bounds and clamp restored frames to the visible screen area.
+- **Universal Synchronization**: Every IDE must preserve and synchronize this rule across shared IDE rules and connected-app instructions.
