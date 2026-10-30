@@ -1931,3 +1931,33 @@ Every macOS and desktop app across the ecosystem (`BanX`, `GTD`, `AiMailx`, `Not
 - **Automatic Save on Resize, Move, and Close**: Persist the main window's width, height, and screen coordinates whenever the user resizes, moves, or closes the window (`UserDefaults` + explicit `NSWindow` frame observer on SwiftUI/AppKit, `setFrameUsingName` / `setFrameAutosaveName` on Flutter macOS, `window-state.json` on Tauri and Electron).
 - **Guard Against Launch-Screen Shrink & ASLR Autosave Drift**: Never allow launch screens (`ZStack` splash overlays), `.onOpenURL` `SceneBridgeReader` wrapper type changes, or initial layout passes to overwrite the saved window frame or shrink the window into a narrow/mobile strip on desktop. Enforce sensible desktop minimum bounds and clamp restored frames to the visible screen area.
 - **Universal Synchronization**: Every IDE must preserve and synchronize this rule across shared IDE rules and connected-app instructions.
+
+
+## GTD In-Card Sliders Edit Controls (Owner, 29 October 2026)
+
+In GTD organization drill-down project and group cards, keep the edit action inside the card’s right edge, vertically aligned below the navigation chevron. Use the existing SlidersHorizontal icon for edit, never a pencil. Keep the name area clear, preserve separate accessible navigation and edit buttons with usable touch targets, and show edit only under existing scope permissions. Apply the same sliders edit icon to project/group detail identity controls. This changes GTD presentation only; preserve data, navigation, permissions and cross-app contracts. Every IDE must preserve and synchronize this preference across shared IDE rules and connected-app instructions.
+
+
+## GTD Project Count And Scope Editor Presentation (Owner, 29 October 2026)
+
+In GTD organization project lists, show the project count at the left of the same action row as the right-aligned Add Project button. Keep the shared project/group editor harmonious and symmetric with the app’s existing styling, balanced spacing and compact actions. Do not expose Firebase or storage image URLs in this editor; retain image selection, drag-and-drop upload and removal controls. Preserve existing scope permissions, saved images, data and navigation. Every IDE must preserve and synchronize this GTD-specific preference across shared IDE rules and connected-app instructions.
+
+
+## GTD Stable Scope Editor And Image Sources (Owner, 29 October 2026)
+
+The GTD project/group editor must stay open when the native photo chooser is dismissed or the user clicks outside. Only explicit Cancel or optimistic Save dismisses it; failed saves reopen it with the draft and selected image retained. Use an inline image-source chooser with Upload, Search Web Images and AI Design, following AI MailX’s image-menu pattern. AI Design creates a real image based on the project/group name with organization colors used only as subtle accents. Preserve existing permissions, validate selected image bytes before upload, show immediate loading/error feedback, and never replace generation with a fake placeholder. Every IDE must preserve and synchronize this GTD-specific preference across shared IDE rules and connected-app instructions.
+
+
+## GTD Compact Quick Task Editor And Today-First Calendar (Owner, 29 October 2026)
+
+Keep the GTD Quick Task editor compact and harmonious: remove vacant space, balance and align controls symmetrically, and keep the action footer visible while longer content scrolls. When opening its date picker, start calendar navigation at today rather than the task’s original date. Keep the existing saved/draft due date unchanged until the user explicitly selects a date; opening or cancelling the picker never reschedules a task. Preserve responsive layouts, safe areas, accessibility and existing task behavior. Every IDE must preserve and synchronize this GTD-specific preference across shared IDE rules and connected-app instructions.
+
+
+## GTD Clear Multi-Selection And Bulk Dates (Owner, 29 October 2026)
+
+In GTD task lists, long press enters a clear selection mode with a visible selected count and the instruction Tap Tasks To Select More; tapping more tasks toggles their selection instead of opening details. Replace the cluttered Done, Snooze, Someday, Focus, Context, Archive and Delete bulk panel with compact due-date actions Tomorrow, Next Week, Next Month and Custom, plus Clear Selection. Apply dates only to selected tasks under existing permissions; use local calendar arithmetic and clamp Next Month to the last valid day when needed. Show immediate action-specific loading feedback, disable duplicate actions, and retain selection with a clear error on failure. Every IDE must preserve and synchronize this GTD-specific preference across shared IDE rules and connected-app instructions.
+
+
+## GTD Compact In-Card Multi-Selection (Owner, 30 October 2026)
+
+GTD selection checkboxes stay compact inside each rounded task card; never create a continuous white checkbox rail beside the list. Selected cards use a subtle rounded tint and inset border instead of thick square outlines. Keep the bulk due-date toolbar compact, balanced and clear of the list, and hide conflicting task-creation floating buttons while selection is active. Preserve the selected count, date actions, readable touch targets, keyboard accessibility and existing scope permissions. Every IDE must preserve and synchronize this GTD-specific preference across shared IDE rules and connected-app instructions.
