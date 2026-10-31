@@ -1961,3 +1961,6 @@ In GTD task lists, long press enters a clear selection mode with a visible selec
 ## GTD Compact In-Card Multi-Selection (Owner, 30 October 2026)
 
 GTD selection checkboxes stay compact inside each rounded task card; never create a continuous white checkbox rail beside the list. Selected cards use a subtle rounded tint and inset border instead of thick square outlines. Keep the bulk due-date toolbar compact, balanced and clear of the list, and hide conflicting task-creation floating buttons while selection is active. Preserve the selected count, date actions, readable touch targets, keyboard accessibility and existing scope permissions. Every IDE must preserve and synchronize this GTD-specific preference across shared IDE rules and connected-app instructions.
+## No Em Dash (`—`) In AI Writing & Drafted Emails (Owner, 31 October 2026)
+
+Never use the em dash character (`—` / `\u2014`) in chat replies, drafted emails, messages, documentation, or UI copy across any IDE or AI agent. Use a normal comma, period, colon, parentheses, or standard hyphen (`-`) instead. Every IDE must preserve and synchronize this rule across shared IDE rules and connected-app instructions.
